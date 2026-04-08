@@ -8,12 +8,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - Replace `WriteString(Sprintf)` with `Fprintf` to satisfy staticcheck QF1012
+- Schema `owner` attribute left unknown after Create and Update (Computed attribute must be known after apply)
+- Role and schema `name` not populated in Read after `terraform import`
+- User and connection `ID` overwritten from empty `name` after `terraform import`
+- Connection Read now reads `to` and `user` from `EXA_DBA_CONNECTIONS` (previously only checked existence)
+- User Read switched from `EXA_ALL_USERS` to `EXA_DBA_USERS` to detect auth type, LDAP DN, and OpenID subject after import
+- User Read now always infers `auth_type` from DB (detects external auth changes, clears stale `ldap_dn`/`openid_subject`)
+- Connection Read clears `user` when removed externally (drift was invisible)
+- Connection name no longer uppercased in state (caused perpetual drift when config used non-uppercase)
+
+### Added
+- Unit tests for helpers, security functions, SQL builders, and ID builders (41 tests)
+- Terraform acceptance tests for all resource types: create, rename (verified in-place), import, CheckDestroy (11 tests)
+- `CHANGELOG.md` as single source of truth for release notes
 
 ### Changed
 - CI no longer triggers a release on every push to main; releases only when version is bumped
 - Update exasol-driver-go 1.0.14 to 1.0.16
 - Update terraform-plugin-framework 1.16.0 to 1.19.0
 - Update terraform-plugin-log 0.9.0 to 0.10.0
+- Connection pool tuning: `MaxIdleConns=10`, `MaxOpenConns=10` (reduces session churn from 40 to 10 on large workloads)
+- Delete stale `user_resource.go.bak`
 
 ### Security
 - Bump google.golang.org/grpc 1.75.1 to 1.79.3 (authorization bypass fix)
