@@ -3,20 +3,26 @@
 package resources_test
 
 import (
+	"context"
+	"database/sql"
+	"fmt"
 	"os"
 	"testing"
 
 	"terraform-provider-exasol/internal/provider"
 
+	"github.com/exasol/exasol-driver-go"
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
 )
 
-func testProviderFactories() map[string]func() (tfprotov6.ProviderServer, error) {
-	return map[string]func() (tfprotov6.ProviderServer, error){
-		"exasol": providerserver.NewProtocol6WithError(provider.New("test")()),
-	}
+// --- Test infrastructure ---
+
+var testAccProtoV6ProviderFactories = map[string]func() (tfprotov6.ProviderServer, error){
+	"exasol": providerserver.NewProtocol6WithError(provider.New("test")()),
 }
 
 func providerConfig() string {
@@ -43,161 +49,344 @@ func envOrDefault(key, fallback string) string {
 	return fallback
 }
 
-// --- Role: create, rename, destroy ---
+func testAccPreCheck(t *testing.T) {
+	t.Helper()
+	db := testAccDB(t)
+	defer db.Close()
+}
 
-func TestAccRole_CreateAndRename(t *testing.T) {
-	resource.Test(t, resource.TestCase{
-		ProtoV6ProviderFactories: testProviderFactories(),
+func testAccDB(t *testing.T) *sql.DB {
+	t.Helper()
+	host := envOrDefault("EXASOL_HOST", "localhost")
+	user := envOrDefault("EXASOL_USER", "sys")
+	password := envOrDefault("EXASOL_PASSWORD", "exasol")
+
+	dsn := exasol.NewConfig(user, password).
+		Host(host).
+		Port(8563).
+		ValidateServerCertificate(false).
+		String()
+
+	db, err := sql.Open("exasol", dsn)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		t.Fatalf("Exasol not reachable (is Docker container running?): %v", err)
+	}
+	return db
+}
+
+// --- CheckDestroy functions ---
+
+func testAccCheckRoleDestroy(s *terraform.State) error {
+	db := mustOpenDB()
+	defer db.Close()
+	for _, rs := range s.RootModule().Resources {
+		if rs.Type != "exasol_role" {
+			continue
+		}
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_ROLES WHERE ROLE_NAME = ?`, rs.Primary.ID).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return fmt.Errorf("role %s still exists after destroy", rs.Primary.ID)
+		}
+	}
+	return nil
+}
+
+func testAccCheckUserDestroy(s *terraform.State) error {
+	db := mustOpenDB()
+	defer db.Close()
+	for _, rs := range s.RootModule().Resources {
+		if rs.Type != "exasol_user" {
+			continue
+		}
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_USERS WHERE USER_NAME = ?`, rs.Primary.ID).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return fmt.Errorf("user %s still exists after destroy", rs.Primary.ID)
+		}
+	}
+	return nil
+}
+
+func testAccCheckSchemaDestroy(s *terraform.State) error {
+	db := mustOpenDB()
+	defer db.Close()
+	for _, rs := range s.RootModule().Resources {
+		if rs.Type != "exasol_schema" {
+			continue
+		}
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_SCHEMAS WHERE SCHEMA_NAME = ?`, rs.Primary.ID).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return fmt.Errorf("schema %s still exists after destroy", rs.Primary.ID)
+		}
+	}
+	return nil
+}
+
+func testAccCheckConnectionDestroy(s *terraform.State) error {
+	db := mustOpenDB()
+	defer db.Close()
+	for _, rs := range s.RootModule().Resources {
+		if rs.Type != "exasol_connection" {
+			continue
+		}
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_CONNECTIONS WHERE CONNECTION_NAME = ?`, rs.Primary.ID).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return fmt.Errorf("connection %s still exists after destroy", rs.Primary.ID)
+		}
+	}
+	return nil
+}
+
+func mustOpenDB() *sql.DB {
+	host := envOrDefault("EXASOL_HOST", "localhost")
+	user := envOrDefault("EXASOL_USER", "sys")
+	password := envOrDefault("EXASOL_PASSWORD", "exasol")
+
+	dsn := exasol.NewConfig(user, password).
+		Host(host).
+		Port(8563).
+		ValidateServerCertificate(false).
+		String()
+
+	db, err := sql.Open("exasol", dsn)
+	if err != nil {
+		panic(fmt.Sprintf("CheckDestroy: failed to open database: %v", err))
+	}
+	return db
+}
+
+// --- Role: create, rename (update in-place), import ---
+
+func TestAccRole_FullLifecycle(t *testing.T) {
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
 		Steps: []resource.TestStep{
 			{
 				Config: providerConfig() + `
 resource "exasol_role" "test" {
-  name = "ACC_TEST_ROLE_V1"
+  name = "ACC_ROLE_LIFECYCLE_V1"
 }`,
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("exasol_role.test", "name", "ACC_TEST_ROLE_V1"),
-					resource.TestCheckResourceAttr("exasol_role.test", "id", "ACC_TEST_ROLE_V1"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_role.test", "name", "ACC_ROLE_LIFECYCLE_V1"),
+					resource.TestCheckResourceAttr("exasol_role.test", "id", "ACC_ROLE_LIFECYCLE_V1"),
 				),
 			},
+			// Rename: assert update in-place, NOT destroy+create
 			{
 				Config: providerConfig() + `
 resource "exasol_role" "test" {
-  name = "ACC_TEST_ROLE_V2"
+  name = "ACC_ROLE_LIFECYCLE_V2"
 }`,
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("exasol_role.test", "name", "ACC_TEST_ROLE_V2"),
-					resource.TestCheckResourceAttr("exasol_role.test", "id", "ACC_TEST_ROLE_V2"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("exasol_role.test", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_role.test", "name", "ACC_ROLE_LIFECYCLE_V2"),
+					resource.TestCheckResourceAttr("exasol_role.test", "id", "ACC_ROLE_LIFECYCLE_V2"),
 				),
+			},
+			// Import
+			{
+				ResourceName:      "exasol_role.test",
+				ImportState:       true,
+				ImportStateVerify: true,
 			},
 		},
 	})
 }
 
-// --- User: create, rename, destroy ---
+// --- User: create, rename (update in-place), import ---
 
-func TestAccUser_CreateAndRename(t *testing.T) {
-	resource.Test(t, resource.TestCase{
-		ProtoV6ProviderFactories: testProviderFactories(),
+func TestAccUser_FullLifecycle(t *testing.T) {
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckUserDestroy,
 		Steps: []resource.TestStep{
 			{
 				Config: providerConfig() + `
 resource "exasol_user" "test" {
-  name      = "ACC_TEST_USER_V1"
+  name      = "ACC_USER_LIFECYCLE_V1"
   auth_type = "PASSWORD"
   password  = "TestPass123"
 }`,
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("exasol_user.test", "name", "ACC_TEST_USER_V1"),
-					resource.TestCheckResourceAttr("exasol_user.test", "id", "ACC_TEST_USER_V1"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_user.test", "name", "ACC_USER_LIFECYCLE_V1"),
+					resource.TestCheckResourceAttr("exasol_user.test", "id", "ACC_USER_LIFECYCLE_V1"),
+					resource.TestCheckResourceAttr("exasol_user.test", "auth_type", "PASSWORD"),
 				),
 			},
+			// Rename: assert update in-place
 			{
 				Config: providerConfig() + `
 resource "exasol_user" "test" {
-  name      = "ACC_TEST_USER_V2"
+  name      = "ACC_USER_LIFECYCLE_V2"
   auth_type = "PASSWORD"
   password  = "TestPass123"
 }`,
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("exasol_user.test", "name", "ACC_TEST_USER_V2"),
-					resource.TestCheckResourceAttr("exasol_user.test", "id", "ACC_TEST_USER_V2"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("exasol_user.test", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_user.test", "name", "ACC_USER_LIFECYCLE_V2"),
+					resource.TestCheckResourceAttr("exasol_user.test", "id", "ACC_USER_LIFECYCLE_V2"),
 				),
+			},
+			// Import (password can't be read back)
+			{
+				ResourceName:            "exasol_user.test",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"password", "auth_type", "ldap_dn", "openid_subject"},
 			},
 		},
 	})
 }
 
-// --- Schema: create, rename, ownership ---
+// --- Schema: create, rename, ownership, import ---
 
-func TestAccSchema_CreateAndRename(t *testing.T) {
-	resource.Test(t, resource.TestCase{
-		ProtoV6ProviderFactories: testProviderFactories(),
+func TestAccSchema_FullLifecycle(t *testing.T) {
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckSchemaDestroy,
 		Steps: []resource.TestStep{
 			{
 				Config: providerConfig() + `
 resource "exasol_schema" "test" {
-  name = "ACC_TEST_SCHEMA_V1"
+  name = "ACC_SCHEMA_LIFECYCLE_V1"
 }`,
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("exasol_schema.test", "name", "ACC_TEST_SCHEMA_V1"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_schema.test", "name", "ACC_SCHEMA_LIFECYCLE_V1"),
 					resource.TestCheckResourceAttrSet("exasol_schema.test", "owner"),
 				),
 			},
+			// Rename: assert update in-place
 			{
 				Config: providerConfig() + `
 resource "exasol_schema" "test" {
-  name = "ACC_TEST_SCHEMA_V2"
+  name = "ACC_SCHEMA_LIFECYCLE_V2"
 }`,
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("exasol_schema.test", "name", "ACC_TEST_SCHEMA_V2"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("exasol_schema.test", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_schema.test", "name", "ACC_SCHEMA_LIFECYCLE_V2"),
 					resource.TestCheckResourceAttrSet("exasol_schema.test", "owner"),
 				),
+			},
+			// Import
+			{
+				ResourceName:      "exasol_schema.test",
+				ImportState:       true,
+				ImportStateVerify: true,
 			},
 		},
 	})
 }
 
 func TestAccSchema_WithOwner(t *testing.T) {
-	resource.Test(t, resource.TestCase{
-		ProtoV6ProviderFactories: testProviderFactories(),
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckSchemaDestroy,
 		Steps: []resource.TestStep{
 			{
 				Config: providerConfig() + `
 resource "exasol_role" "owner" {
-  name = "ACC_TEST_SCHEMA_OWNER"
+  name = "ACC_SCHEMA_OWNER_ROLE"
 }
 resource "exasol_schema" "test" {
-  name  = "ACC_TEST_OWNED_SCHEMA"
+  name  = "ACC_OWNED_SCHEMA"
   owner = exasol_role.owner.name
 }`,
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("exasol_schema.test", "owner", "ACC_TEST_SCHEMA_OWNER"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_schema.test", "owner", "ACC_SCHEMA_OWNER_ROLE"),
 				),
 			},
 		},
 	})
 }
 
-// --- Connection: create, rename, update credentials ---
+// --- Connection: create, rename, import ---
 
-func TestAccConnection_CreateAndRename(t *testing.T) {
-	resource.Test(t, resource.TestCase{
-		ProtoV6ProviderFactories: testProviderFactories(),
+func TestAccConnection_FullLifecycle(t *testing.T) {
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckConnectionDestroy,
 		Steps: []resource.TestStep{
 			{
 				Config: providerConfig() + `
 resource "exasol_connection" "test" {
-  name = "ACC_TEST_CONN_V1"
+  name = "ACC_CONN_LIFECYCLE_V1"
   to   = "localhost:8563"
 }`,
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("exasol_connection.test", "name", "ACC_TEST_CONN_V1"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_connection.test", "name", "ACC_CONN_LIFECYCLE_V1"),
+					resource.TestCheckResourceAttr("exasol_connection.test", "id", "ACC_CONN_LIFECYCLE_V1"),
 				),
 			},
+			// Rename: assert update in-place
 			{
 				Config: providerConfig() + `
 resource "exasol_connection" "test" {
-  name = "ACC_TEST_CONN_V2"
+  name = "ACC_CONN_LIFECYCLE_V2"
   to   = "localhost:8563"
 }`,
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("exasol_connection.test", "name", "ACC_TEST_CONN_V2"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("exasol_connection.test", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_connection.test", "name", "ACC_CONN_LIFECYCLE_V2"),
 				),
+			},
+			// Import (password/user can't be read back)
+			{
+				ResourceName:            "exasol_connection.test",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"to", "user", "password"},
 			},
 		},
 	})
 }
 
-// --- System Privilege: grant, admin option toggle ---
+// --- System Privilege: grant, admin option toggle, import ---
 
-func TestAccSystemPrivilege_WithAdminOption(t *testing.T) {
-	resource.Test(t, resource.TestCase{
-		ProtoV6ProviderFactories: testProviderFactories(),
+func TestAccSystemPrivilege_FullLifecycle(t *testing.T) {
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
 				Config: providerConfig() + `
 resource "exasol_user" "test" {
-  name      = "ACC_TEST_SYSPRIV_USER"
+  name      = "ACC_SYSPRIV_USER"
   auth_type = "PASSWORD"
   password  = "TestPass123"
 }
@@ -205,14 +394,16 @@ resource "exasol_system_privilege" "test" {
   grantee   = exasol_user.test.name
   privilege = "CREATE TABLE"
 }`,
-				Check: resource.ComposeTestCheckFunc(
+				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("exasol_system_privilege.test", "privilege", "CREATE TABLE"),
+					resource.TestCheckResourceAttr("exasol_system_privilege.test", "grantee", "ACC_SYSPRIV_USER"),
 				),
 			},
+			// Toggle admin option on
 			{
 				Config: providerConfig() + `
 resource "exasol_user" "test" {
-  name      = "ACC_TEST_SYSPRIV_USER"
+  name      = "ACC_SYSPRIV_USER"
   auth_type = "PASSWORD"
   password  = "TestPass123"
 }
@@ -221,27 +412,34 @@ resource "exasol_system_privilege" "test" {
   privilege         = "CREATE TABLE"
   with_admin_option = true
 }`,
-				Check: resource.ComposeTestCheckFunc(
+				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("exasol_system_privilege.test", "with_admin_option", "true"),
 				),
+			},
+			// Import
+			{
+				ResourceName:      "exasol_system_privilege.test",
+				ImportState:       true,
+				ImportStateVerify: true,
 			},
 		},
 	})
 }
 
-// --- Role Grant: grant, admin option ---
+// --- Role Grant: grant, admin option, import ---
 
-func TestAccRoleGrant_WithAdminOption(t *testing.T) {
-	resource.Test(t, resource.TestCase{
-		ProtoV6ProviderFactories: testProviderFactories(),
+func TestAccRoleGrant_FullLifecycle(t *testing.T) {
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
 				Config: providerConfig() + `
 resource "exasol_role" "granted" {
-  name = "ACC_TEST_GRANTED_ROLE"
+  name = "ACC_ROLEGRANT_ROLE"
 }
 resource "exasol_user" "grantee" {
-  name      = "ACC_TEST_ROLEGRANT_USER"
+  name      = "ACC_ROLEGRANT_USER"
   auth_type = "PASSWORD"
   password  = "TestPass123"
 }
@@ -249,18 +447,19 @@ resource "exasol_role_grant" "test" {
   role    = exasol_role.granted.name
   grantee = exasol_user.grantee.name
 }`,
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("exasol_role_grant.test", "role", "ACC_TEST_GRANTED_ROLE"),
-					resource.TestCheckResourceAttr("exasol_role_grant.test", "grantee", "ACC_TEST_ROLEGRANT_USER"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_role_grant.test", "role", "ACC_ROLEGRANT_ROLE"),
+					resource.TestCheckResourceAttr("exasol_role_grant.test", "grantee", "ACC_ROLEGRANT_USER"),
 				),
 			},
+			// Toggle admin option on
 			{
 				Config: providerConfig() + `
 resource "exasol_role" "granted" {
-  name = "ACC_TEST_GRANTED_ROLE"
+  name = "ACC_ROLEGRANT_ROLE"
 }
 resource "exasol_user" "grantee" {
-  name      = "ACC_TEST_ROLEGRANT_USER"
+  name      = "ACC_ROLEGRANT_USER"
   auth_type = "PASSWORD"
   password  = "TestPass123"
 }
@@ -269,27 +468,34 @@ resource "exasol_role_grant" "test" {
   grantee           = exasol_user.grantee.name
   with_admin_option = true
 }`,
-				Check: resource.ComposeTestCheckFunc(
+				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("exasol_role_grant.test", "with_admin_option", "true"),
 				),
+			},
+			// Import
+			{
+				ResourceName:      "exasol_role_grant.test",
+				ImportState:       true,
+				ImportStateVerify: true,
 			},
 		},
 	})
 }
 
-// --- Object Privilege ---
+// --- Object Privilege: grant, add privilege ---
 
 func TestAccObjectPrivilege_OnSchema(t *testing.T) {
-	resource.Test(t, resource.TestCase{
-		ProtoV6ProviderFactories: testProviderFactories(),
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
 				Config: providerConfig() + `
 resource "exasol_schema" "test" {
-  name = "ACC_TEST_OBJPRIV_SCHEMA"
+  name = "ACC_OBJPRIV_SCHEMA"
 }
 resource "exasol_role" "test" {
-  name = "ACC_TEST_OBJPRIV_ROLE"
+  name = "ACC_OBJPRIV_ROLE"
 }
 resource "exasol_object_privilege" "test" {
   grantee     = exasol_role.test.name
@@ -297,17 +503,19 @@ resource "exasol_object_privilege" "test" {
   object_type = "SCHEMA"
   object_name = exasol_schema.test.name
 }`,
-				Check: resource.ComposeTestCheckFunc(
+				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("exasol_object_privilege.test", "object_type", "SCHEMA"),
+					resource.TestCheckResourceAttr("exasol_object_privilege.test", "privileges.#", "1"),
 				),
 			},
+			// Add a privilege
 			{
 				Config: providerConfig() + `
 resource "exasol_schema" "test" {
-  name = "ACC_TEST_OBJPRIV_SCHEMA"
+  name = "ACC_OBJPRIV_SCHEMA"
 }
 resource "exasol_role" "test" {
-  name = "ACC_TEST_OBJPRIV_ROLE"
+  name = "ACC_OBJPRIV_ROLE"
 }
 resource "exasol_object_privilege" "test" {
   grantee     = exasol_role.test.name
@@ -315,7 +523,12 @@ resource "exasol_object_privilege" "test" {
   object_type = "SCHEMA"
   object_name = exasol_schema.test.name
 }`,
-				Check: resource.ComposeTestCheckFunc(
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("exasol_object_privilege.test", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("exasol_object_privilege.test", "privileges.#", "2"),
 				),
 			},
@@ -326,25 +539,34 @@ resource "exasol_object_privilege" "test" {
 // --- Connection Grant ---
 
 func TestAccConnectionGrant(t *testing.T) {
-	resource.Test(t, resource.TestCase{
-		ProtoV6ProviderFactories: testProviderFactories(),
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
 				Config: providerConfig() + `
 resource "exasol_connection" "test" {
-  name = "ACC_TEST_CONNGRANT_CONN"
+  name = "ACC_CONNGRANT_CONN"
   to   = "localhost:8563"
 }
 resource "exasol_role" "test" {
-  name = "ACC_TEST_CONNGRANT_ROLE"
+  name = "ACC_CONNGRANT_ROLE"
 }
 resource "exasol_connection_grant" "test" {
   connection_name = exasol_connection.test.name
   grantee         = exasol_role.test.name
 }`,
-				Check: resource.ComposeTestCheckFunc(
+				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet("exasol_connection_grant.test", "id"),
+					resource.TestCheckResourceAttr("exasol_connection_grant.test", "connection_name", "ACC_CONNGRANT_CONN"),
+					resource.TestCheckResourceAttr("exasol_connection_grant.test", "grantee", "ACC_CONNGRANT_ROLE"),
 				),
+			},
+			// Import
+			{
+				ResourceName:      "exasol_connection_grant.test",
+				ImportState:       true,
+				ImportStateVerify: true,
 			},
 		},
 	})

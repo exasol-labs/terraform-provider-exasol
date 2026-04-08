@@ -143,9 +143,12 @@ func (r *ConnectionResource) Read(ctx context.Context, req resource.ReadRequest,
 		return
 	}
 
+	// After import, name is empty - populate it from the ID
+	if state.Name.IsNull() || state.Name.ValueString() == "" {
+		state.Name = state.ID
+	}
 	// Note: We cannot read back the password or exact connection string for security reasons
 	// Exasol doesn't expose these values in system tables
-	// Keep the state as-is if the connection exists
 	state.ID = types.StringValue(strings.ToUpper(state.Name.ValueString()))
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }

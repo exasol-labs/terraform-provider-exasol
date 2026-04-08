@@ -158,7 +158,11 @@ func (r *SchemaResource) Read(ctx context.Context, req resource.ReadRequest, res
 		state.Owner = types.StringNull()
 	}
 
-	// Keep user-defined case in state
+	// After import, name is empty - populate it from the ID
+	if state.Name.IsNull() || state.Name.ValueString() == "" {
+		state.Name = state.ID
+	}
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
