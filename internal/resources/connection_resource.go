@@ -130,10 +130,12 @@ func (r *ConnectionResource) Read(ctx context.Context, req resource.ReadRequest,
 		return
 	}
 
-	// Query EXA_DBA_CONNECTIONS to check if connection exists
-	var dummy int
-	query := `SELECT 1 FROM EXA_DBA_CONNECTIONS WHERE CONNECTION_NAME = ?`
-	err := r.db.QueryRowContext(ctx, query, state.ID.ValueString()).Scan(&dummy)
+	// Read back connection details from EXA_DBA_CONNECTIONS.
+	// CONNECTION_STRING and USER_NAME are exposed; password is not.
+	var connString sql.NullString
+	var userName sql.NullString
+	query := `SELECT CONNECTION_STRING, USER_NAME FROM EXA_DBA_CONNECTIONS WHERE CONNECTION_NAME = ?`
+	err := r.db.QueryRowContext(ctx, query, state.ID.ValueString()).Scan(&connString, &userName)
 	if err == sql.ErrNoRows {
 		resp.State.RemoveResource(ctx)
 		return
@@ -147,9 +149,17 @@ func (r *ConnectionResource) Read(ctx context.Context, req resource.ReadRequest,
 	if state.Name.IsNull() || state.Name.ValueString() == "" {
 		state.Name = state.ID
 	}
-	// Note: We cannot read back the password or exact connection string for security reasons
-	// Exasol doesn't expose these values in system tables
 	state.ID = types.StringValue(strings.ToUpper(state.Name.ValueString()))
+
+	// Populate readable attributes from DB
+	if connString.Valid {
+		state.To = types.StringValue(connString.String)
+	}
+	if userName.Valid && userName.String != "" {
+		state.User = types.StringValue(userName.String)
+	}
+	// Password is not exposed by Exasol - keep whatever is in state
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 

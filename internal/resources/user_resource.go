@@ -135,10 +135,13 @@ func (r *UserResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 		return
 	}
 
-	var dummy int
+	// Read back user details from EXA_DBA_USERS.
+	// DISTINGUISHED_NAME and OPENID_SUBJECT are readable; password is a hash (not usable).
+	var distinguishedName sql.NullString
+	var openidSubject sql.NullString
 	err := r.db.QueryRowContext(ctx,
-		`SELECT 1 FROM EXA_ALL_USERS WHERE USER_NAME = ?`,
-		state.ID.ValueString()).Scan(&dummy)
+		`SELECT DISTINGUISHED_NAME, OPENID_SUBJECT FROM EXA_DBA_USERS WHERE USER_NAME = ?`,
+		state.ID.ValueString()).Scan(&distinguishedName, &openidSubject)
 	if err == sql.ErrNoRows {
 		resp.State.RemoveResource(ctx)
 		return
@@ -147,12 +150,26 @@ func (r *UserResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 		resp.Diagnostics.AddError("Read user failed", err.Error())
 		return
 	}
+
 	// After import, name is empty - populate it from the ID
 	if state.Name.IsNull() || state.Name.ValueString() == "" {
 		state.Name = state.ID
 	}
-	// keep original attributes except we always keep ID uppercase
 	state.ID = types.StringValue(strings.ToUpper(state.Name.ValueString()))
+
+	// Infer auth type and populate readable attributes from DB
+	if distinguishedName.Valid && distinguishedName.String != "" {
+		state.AuthType = types.StringValue("LDAP")
+		state.LDAPDN = types.StringValue(distinguishedName.String)
+	} else if openidSubject.Valid && openidSubject.String != "" {
+		state.AuthType = types.StringValue("OPENID")
+		state.OpenIDSubject = types.StringValue(openidSubject.String)
+	} else if state.AuthType.IsNull() || state.AuthType.ValueString() == "" {
+		// Only set PASSWORD if auth_type is not already known (import case)
+		state.AuthType = types.StringValue("PASSWORD")
+	}
+	// Password is a hash in EXA_DBA_USERS - keep whatever is in state
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 

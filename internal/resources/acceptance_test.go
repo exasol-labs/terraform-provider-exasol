@@ -151,6 +151,63 @@ func testAccCheckConnectionDestroy(s *terraform.State) error {
 	return nil
 }
 
+func testAccCheckSystemPrivilegeDestroy(s *terraform.State) error {
+	db := mustOpenDB()
+	defer db.Close()
+	for _, rs := range s.RootModule().Resources {
+		if rs.Type != "exasol_system_privilege" {
+			continue
+		}
+		// ID format: GRANTEE|PRIVILEGE|ADMIN_OPTION
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE || '|' || PRIVILEGE LIKE ?`, rs.Primary.ID+"%").Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return fmt.Errorf("system privilege %s still exists after destroy", rs.Primary.ID)
+		}
+	}
+	return nil
+}
+
+func testAccCheckRoleGrantDestroy(s *terraform.State) error {
+	db := mustOpenDB()
+	defer db.Close()
+	for _, rs := range s.RootModule().Resources {
+		if rs.Type != "exasol_role_grant" {
+			continue
+		}
+		// ID format: ROLE|GRANTEE|ADMIN_OPTION
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_ROLE_PRIVS WHERE GRANTED_ROLE || '|' || GRANTEE LIKE ?`, rs.Primary.ID+"%").Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return fmt.Errorf("role grant %s still exists after destroy", rs.Primary.ID)
+		}
+	}
+	return nil
+}
+
+func testAccCheckConnectionGrantDestroy(s *terraform.State) error {
+	db := mustOpenDB()
+	defer db.Close()
+	for _, rs := range s.RootModule().Resources {
+		if rs.Type != "exasol_connection_grant" {
+			continue
+		}
+		// ID format: CONNECTION_NAME|GRANTEE
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_CONNECTION_PRIVS WHERE GRANTED_CONNECTION || '|' || GRANTEE = ?`, rs.Primary.ID).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return fmt.Errorf("connection grant %s still exists after destroy", rs.Primary.ID)
+		}
+	}
+	return nil
+}
+
 func mustOpenDB() *sql.DB {
 	host := envOrDefault("EXASOL_HOST", "localhost")
 	user := envOrDefault("EXASOL_USER", "sys")
@@ -252,12 +309,12 @@ resource "exasol_user" "test" {
 					resource.TestCheckResourceAttr("exasol_user.test", "id", "ACC_USER_LIFECYCLE_V2"),
 				),
 			},
-			// Import (password can't be read back)
+			// Import (password is write-only; auth_type is inferred from DB)
 			{
 				ResourceName:            "exasol_user.test",
 				ImportState:             true,
 				ImportStateVerify:       true,
-				ImportStateVerifyIgnore: []string{"password", "auth_type", "ldap_dn", "openid_subject"},
+				ImportStateVerifyIgnore: []string{"password"},
 			},
 		},
 	})
@@ -365,12 +422,12 @@ resource "exasol_connection" "test" {
 					resource.TestCheckResourceAttr("exasol_connection.test", "name", "ACC_CONN_LIFECYCLE_V2"),
 				),
 			},
-			// Import (password/user can't be read back)
+			// Import (password is write-only; to and user are read from DB)
 			{
 				ResourceName:            "exasol_connection.test",
 				ImportState:             true,
 				ImportStateVerify:       true,
-				ImportStateVerifyIgnore: []string{"to", "user", "password"},
+				ImportStateVerifyIgnore: []string{"password"},
 			},
 		},
 	})
@@ -382,6 +439,7 @@ func TestAccSystemPrivilege_FullLifecycle(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckSystemPrivilegeDestroy,
 		Steps: []resource.TestStep{
 			{
 				Config: providerConfig() + `
@@ -432,6 +490,7 @@ func TestAccRoleGrant_FullLifecycle(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleGrantDestroy,
 		Steps: []resource.TestStep{
 			{
 				Config: providerConfig() + `
@@ -542,6 +601,7 @@ func TestAccConnectionGrant(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckConnectionGrantDestroy,
 		Steps: []resource.TestStep{
 			{
 				Config: providerConfig() + `
