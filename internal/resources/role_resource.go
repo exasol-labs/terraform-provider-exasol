@@ -122,6 +122,10 @@ func (r *RoleResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 
 	// keep the user's spelling of name; only update id (upper-case in DB)
 	state.ID = types.StringValue(upper(current))
+	// After import, name is empty - populate it from the database
+	if state.Name.IsNull() || state.Name.ValueString() == "" {
+		state.Name = types.StringValue(current)
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 

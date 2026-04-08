@@ -110,6 +110,21 @@ func (r *SchemaResource) Create(ctx context.Context, req resource.CreateRequest,
 	}
 
 	plan.ID = plan.Name
+
+	// Read back the actual owner so the Computed attribute is always known after apply
+	var actualOwner sql.NullString
+	err := r.db.QueryRowContext(ctx,
+		`SELECT SCHEMA_OWNER FROM EXA_ALL_SCHEMAS WHERE SCHEMA_NAME = ?`, schemaName).Scan(&actualOwner)
+	if err != nil {
+		resp.Diagnostics.AddError("Read schema owner after create failed", err.Error())
+		return
+	}
+	if actualOwner.Valid {
+		plan.Owner = types.StringValue(actualOwner.String)
+	} else {
+		plan.Owner = types.StringNull()
+	}
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -143,7 +158,11 @@ func (r *SchemaResource) Read(ctx context.Context, req resource.ReadRequest, res
 		state.Owner = types.StringNull()
 	}
 
-	// Keep user-defined case in state
+	// After import, name is empty - populate it from the ID
+	if state.Name.IsNull() || state.Name.ValueString() == "" {
+		state.Name = state.ID
+	}
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -206,6 +225,21 @@ func (r *SchemaResource) Update(ctx context.Context, req resource.UpdateRequest,
 
 	// Update ID and Name to the new name
 	plan.ID = plan.Name
+
+	// Read back the actual owner so the Computed attribute is always known after apply
+	var actualOwner sql.NullString
+	err := r.db.QueryRowContext(ctx,
+		`SELECT SCHEMA_OWNER FROM EXA_ALL_SCHEMAS WHERE SCHEMA_NAME = ?`, newName).Scan(&actualOwner)
+	if err != nil {
+		resp.Diagnostics.AddError("Read schema owner after update failed", err.Error())
+		return
+	}
+	if actualOwner.Valid {
+		plan.Owner = types.StringValue(actualOwner.String)
+	} else {
+		plan.Owner = types.StringNull()
+	}
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 

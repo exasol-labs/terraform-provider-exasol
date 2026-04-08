@@ -135,10 +135,13 @@ func (r *UserResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 		return
 	}
 
-	var dummy int
+	// Read back user details from EXA_DBA_USERS.
+	// DISTINGUISHED_NAME and OPENID_SUBJECT are readable; password is a hash (not usable).
+	var distinguishedName sql.NullString
+	var openidSubject sql.NullString
 	err := r.db.QueryRowContext(ctx,
-		`SELECT 1 FROM EXA_ALL_USERS WHERE USER_NAME = ?`,
-		state.ID.ValueString()).Scan(&dummy)
+		`SELECT DISTINGUISHED_NAME, OPENID_SUBJECT FROM EXA_DBA_USERS WHERE USER_NAME = ?`,
+		state.ID.ValueString()).Scan(&distinguishedName, &openidSubject)
 	if err == sql.ErrNoRows {
 		resp.State.RemoveResource(ctx)
 		return
@@ -147,8 +150,30 @@ func (r *UserResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 		resp.Diagnostics.AddError("Read user failed", err.Error())
 		return
 	}
-	// keep original attributes except we always keep ID uppercase
+
+	// After import, name is empty - populate it from the ID
+	if state.Name.IsNull() || state.Name.ValueString() == "" {
+		state.Name = state.ID
+	}
 	state.ID = types.StringValue(strings.ToUpper(state.Name.ValueString()))
+
+	// Infer auth type from DB and clear stale auth-specific fields.
+	// This ensures drift is detected when auth is changed externally.
+	if distinguishedName.Valid && distinguishedName.String != "" {
+		state.AuthType = types.StringValue("LDAP")
+		state.LDAPDN = types.StringValue(distinguishedName.String)
+		state.OpenIDSubject = types.StringNull()
+	} else if openidSubject.Valid && openidSubject.String != "" {
+		state.AuthType = types.StringValue("OPENID")
+		state.OpenIDSubject = types.StringValue(openidSubject.String)
+		state.LDAPDN = types.StringNull()
+	} else {
+		state.AuthType = types.StringValue("PASSWORD")
+		state.LDAPDN = types.StringNull()
+		state.OpenIDSubject = types.StringNull()
+	}
+	// Password is a hash in EXA_DBA_USERS - keep whatever is in state
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 

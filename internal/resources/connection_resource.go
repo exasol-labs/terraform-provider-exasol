@@ -114,7 +114,7 @@ func (r *ConnectionResource) Create(ctx context.Context, req resource.CreateRequ
 	}
 
 	plan.ID = types.StringValue(upName)
-	plan.Name = types.StringValue(upName)
+	// Keep original name case from config (don't uppercase plan.Name)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -130,10 +130,12 @@ func (r *ConnectionResource) Read(ctx context.Context, req resource.ReadRequest,
 		return
 	}
 
-	// Query EXA_DBA_CONNECTIONS to check if connection exists
-	var dummy int
-	query := `SELECT 1 FROM EXA_DBA_CONNECTIONS WHERE CONNECTION_NAME = ?`
-	err := r.db.QueryRowContext(ctx, query, state.ID.ValueString()).Scan(&dummy)
+	// Read back connection details from EXA_DBA_CONNECTIONS.
+	// CONNECTION_STRING and USER_NAME are exposed; password is not.
+	var connString sql.NullString
+	var userName sql.NullString
+	query := `SELECT CONNECTION_STRING, USER_NAME FROM EXA_DBA_CONNECTIONS WHERE CONNECTION_NAME = ?`
+	err := r.db.QueryRowContext(ctx, query, state.ID.ValueString()).Scan(&connString, &userName)
 	if err == sql.ErrNoRows {
 		resp.State.RemoveResource(ctx)
 		return
@@ -143,10 +145,25 @@ func (r *ConnectionResource) Read(ctx context.Context, req resource.ReadRequest,
 		return
 	}
 
-	// Note: We cannot read back the password or exact connection string for security reasons
-	// Exasol doesn't expose these values in system tables
-	// Keep the state as-is if the connection exists
+	// After import, name is empty - populate it from the ID
+	if state.Name.IsNull() || state.Name.ValueString() == "" {
+		state.Name = state.ID
+	}
 	state.ID = types.StringValue(strings.ToUpper(state.Name.ValueString()))
+
+	// Populate readable attributes from DB.
+	// Always set from DB to detect external changes (drift).
+	if connString.Valid {
+		state.To = types.StringValue(connString.String)
+	}
+	if userName.Valid && userName.String != "" {
+		state.User = types.StringValue(userName.String)
+	} else {
+		// DB has no user - clear it so drift is detected if user was removed externally
+		state.User = types.StringNull()
+	}
+	// Password is not exposed by Exasol - keep whatever is in state
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -199,7 +216,7 @@ func (r *ConnectionResource) Update(ctx context.Context, req resource.UpdateRequ
 	}
 
 	plan.ID = types.StringValue(upNew)
-	plan.Name = types.StringValue(upNew)
+	// Keep original name case from config (don't uppercase plan.Name)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
