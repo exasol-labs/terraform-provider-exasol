@@ -59,6 +59,14 @@ This is a Terraform provider for managing Exasol database resources (users, role
    terraform destroy -auto-approve
    ```
 
+### Changelog Policy
+
+**Every PR MUST include an update to `CHANGELOG.md`**:
+- Add entries under `## [Unreleased]` in the appropriate section (Added, Changed, Fixed, Security)
+- Follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format
+- Be specific: "Fix schema owner unknown after Create" not "Fix bug"
+- When releasing: move Unreleased entries under a new version header, bump version in `main.go`
+
 ### Documentation
 
 **ALWAYS check Exasol documentation at https://docs.exasol.com** when:
