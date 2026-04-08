@@ -469,6 +469,44 @@ resource "exasol_connection" "test" {
 	})
 }
 
+// --- Lowercase names: verify no perpetual drift when config uses non-uppercase ---
+
+func TestAccLowercaseNames_NoDrift(t *testing.T) {
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: providerConfig() + `
+resource "exasol_role" "lc" {
+  name = "acc_lowercase_role"
+}
+resource "exasol_user" "lc" {
+  name      = "acc_lowercase_user"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_schema" "lc" {
+  name = "acc_lowercase_schema"
+}
+resource "exasol_connection" "lc" {
+  name = "acc_lowercase_conn"
+  to   = "localhost:8563"
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_role.lc", "name", "acc_lowercase_role"),
+					resource.TestCheckResourceAttr("exasol_user.lc", "name", "acc_lowercase_user"),
+					resource.TestCheckResourceAttr("exasol_schema.lc", "name", "acc_lowercase_schema"),
+					resource.TestCheckResourceAttr("exasol_connection.lc", "name", "acc_lowercase_conn"),
+				),
+				// Drift detection is automatic: post-apply plan must be empty.
+				// If any resource uppercases the name in state, this step fails
+				// because plan.Name (lowercase) != state.Name (uppercase).
+			},
+		},
+	})
+}
+
 // --- Connection with credentials: verify user round-trips through import ---
 
 func TestAccConnection_WithCredentials(t *testing.T) {

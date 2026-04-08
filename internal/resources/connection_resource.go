@@ -114,7 +114,7 @@ func (r *ConnectionResource) Create(ctx context.Context, req resource.CreateRequ
 	}
 
 	plan.ID = types.StringValue(upName)
-	plan.Name = types.StringValue(upName)
+	// Keep original name case from config (don't uppercase plan.Name)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -216,7 +216,7 @@ func (r *ConnectionResource) Update(ctx context.Context, req resource.UpdateRequ
 	}
 
 	plan.ID = types.StringValue(upNew)
-	plan.Name = types.StringValue(upNew)
+	// Keep original name case from config (don't uppercase plan.Name)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
