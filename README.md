@@ -10,12 +10,17 @@ This provider is not published to the Terraform Registry. Install it from [GitHu
 
 ```bash
 VERSION=0.2.0
-OS=darwin  # or linux
-ARCH=arm64 # or amd64
 
+# Available builds: linux_amd64, darwin_arm64
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
+
+# Download and install
+curl -fLO "https://github.com/exasol-labs/terraform-provider-exasol/releases/download/v${VERSION}/terraform-provider-exasol_${VERSION}_${OS}_${ARCH}.zip"
 mkdir -p ~/.terraform.d/plugins/registry.terraform.io/exasol/exasol/${VERSION}/${OS}_${ARCH}
 unzip terraform-provider-exasol_${VERSION}_${OS}_${ARCH}.zip \
   -d ~/.terraform.d/plugins/registry.terraform.io/exasol/exasol/${VERSION}/${OS}_${ARCH}/
+rm terraform-provider-exasol_${VERSION}_${OS}_${ARCH}.zip
 ```
 
 Then reference it in your Terraform configuration:
