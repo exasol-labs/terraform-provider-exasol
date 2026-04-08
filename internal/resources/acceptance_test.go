@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"terraform-provider-exasol/internal/provider"
@@ -158,9 +159,13 @@ func testAccCheckSystemPrivilegeDestroy(s *terraform.State) error {
 		if rs.Type != "exasol_system_privilege" {
 			continue
 		}
-		// ID format: GRANTEE|PRIVILEGE|ADMIN_OPTION
+		// ID format: GRANTEE|PRIVILEGE|ADMIN_OPTION - parse and query by fields
+		parts := strings.SplitN(rs.Primary.ID, "|", 3)
+		if len(parts) < 2 {
+			continue
+		}
 		var count int
-		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE || '|' || PRIVILEGE LIKE ?`, rs.Primary.ID+"%").Scan(&count); err != nil {
+		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE = ? AND PRIVILEGE = ?`, parts[0], parts[1]).Scan(&count); err != nil {
 			return err
 		}
 		if count > 0 {
@@ -177,13 +182,40 @@ func testAccCheckRoleGrantDestroy(s *terraform.State) error {
 		if rs.Type != "exasol_role_grant" {
 			continue
 		}
-		// ID format: ROLE|GRANTEE|ADMIN_OPTION
+		// ID format: ROLE|GRANTEE|ADMIN_OPTION - parse and query by fields
+		parts := strings.SplitN(rs.Primary.ID, "|", 3)
+		if len(parts) < 2 {
+			continue
+		}
 		var count int
-		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_ROLE_PRIVS WHERE GRANTED_ROLE || '|' || GRANTEE LIKE ?`, rs.Primary.ID+"%").Scan(&count); err != nil {
+		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_ROLE_PRIVS WHERE GRANTED_ROLE = ? AND GRANTEE = ?`, parts[0], parts[1]).Scan(&count); err != nil {
 			return err
 		}
 		if count > 0 {
 			return fmt.Errorf("role grant %s still exists after destroy", rs.Primary.ID)
+		}
+	}
+	return nil
+}
+
+func testAccCheckObjectPrivilegeDestroy(s *terraform.State) error {
+	db := mustOpenDB()
+	defer db.Close()
+	for _, rs := range s.RootModule().Resources {
+		if rs.Type != "exasol_object_privilege" {
+			continue
+		}
+		// ID format: GRANTEE|PRIVILEGES|OBJECT_TYPE|OBJECT_NAME
+		parts := strings.SplitN(rs.Primary.ID, "|", 4)
+		if len(parts) < 4 {
+			continue
+		}
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ? AND OBJECT_TYPE = ? AND OBJECT_NAME = ?`, parts[0], parts[2], parts[3]).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return fmt.Errorf("object privilege %s still exists after destroy", rs.Primary.ID)
 		}
 	}
 	return nil
@@ -196,9 +228,13 @@ func testAccCheckConnectionGrantDestroy(s *terraform.State) error {
 		if rs.Type != "exasol_connection_grant" {
 			continue
 		}
-		// ID format: CONNECTION_NAME|GRANTEE
+		// ID format: CONNECTION_NAME|GRANTEE - parse and query by fields
+		parts := strings.SplitN(rs.Primary.ID, "|", 2)
+		if len(parts) < 2 {
+			continue
+		}
 		var count int
-		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_CONNECTION_PRIVS WHERE GRANTED_CONNECTION || '|' || GRANTEE = ?`, rs.Primary.ID).Scan(&count); err != nil {
+		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_CONNECTION_PRIVS WHERE GRANTED_CONNECTION = ? AND GRANTEE = ?`, parts[0], parts[1]).Scan(&count); err != nil {
 			return err
 		}
 		if count > 0 {
@@ -547,6 +583,7 @@ func TestAccObjectPrivilege_OnSchema(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckObjectPrivilegeDestroy,
 		Steps: []resource.TestStep{
 			{
 				Config: providerConfig() + `

@@ -157,16 +157,20 @@ func (r *UserResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 	}
 	state.ID = types.StringValue(strings.ToUpper(state.Name.ValueString()))
 
-	// Infer auth type and populate readable attributes from DB
+	// Infer auth type from DB and clear stale auth-specific fields.
+	// This ensures drift is detected when auth is changed externally.
 	if distinguishedName.Valid && distinguishedName.String != "" {
 		state.AuthType = types.StringValue("LDAP")
 		state.LDAPDN = types.StringValue(distinguishedName.String)
+		state.OpenIDSubject = types.StringNull()
 	} else if openidSubject.Valid && openidSubject.String != "" {
 		state.AuthType = types.StringValue("OPENID")
 		state.OpenIDSubject = types.StringValue(openidSubject.String)
-	} else if state.AuthType.IsNull() || state.AuthType.ValueString() == "" {
-		// Only set PASSWORD if auth_type is not already known (import case)
+		state.LDAPDN = types.StringNull()
+	} else {
 		state.AuthType = types.StringValue("PASSWORD")
+		state.LDAPDN = types.StringNull()
+		state.OpenIDSubject = types.StringNull()
 	}
 	// Password is a hash in EXA_DBA_USERS - keep whatever is in state
 
