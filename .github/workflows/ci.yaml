@@ -121,11 +121,17 @@ jobs:
           git tag "v$ver" -m "Release v$ver"
           git push origin "v$ver"
 
+      - name: Extract release notes from CHANGELOG.md
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          ver=${{ steps.check.outputs.version }}
+          awk "/^## \\[${ver}\\]/{found=1; next} /^## \\[/{if(found) exit} found" CHANGELOG.md > /tmp/release-notes.md
+
       - name: Run goreleaser
         if: steps.check.outputs.skip == 'false'
         uses: goreleaser/goreleaser-action@v7
         with:
           version: latest
-          args: release --clean
+          args: release --clean --release-header-file /tmp/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
