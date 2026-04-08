@@ -127,7 +127,7 @@ After `make install-local`, configure Terraform to use the local build:
 terraform {
   required_providers {
     exasol = {
-      source = "local/exasol/terraform-provider-exasol"
+      source = "local/exasol/exasol"
     }
   }
 }
@@ -152,7 +152,6 @@ terraform {
   - `object_privilege_resource.go` - Object-level privileges (SELECT, INSERT, etc.)
   - `role_grant_resource.go` - Role membership grants
   - `connection_grant_resource.go` - Connection access grants
-  - `grant_resource.go` - Legacy grant resource (prefer specific grant resources)
   - `security.go` - Security helpers (identifier validation, SQL sanitization)
   - `helpers.go` - Utility functions (identifier quoting, escaping)
 
@@ -217,32 +216,9 @@ terraform {
    terraform destroy -auto-approve
    ```
 
-**For more comprehensive examples, use existing `examples/` directory - DO NOT create new test files**:
-
-1. Use one of the existing example directories:
-   - `examples/privileges/` - System privileges, object privileges, role grants (with and without ADMIN_OPTION)
-   - `examples/grants/` - Legacy grant examples
-   - `examples/connections/` - Connection examples
-   - `examples/basic/` - Basic user/role/schema examples
-2. Create `terraform.tfvars` in the example directory:
-   ```hcl
-   exa_host     = "localhost"
-   exa_user     = "sys"
-   exa_password = "exasol"
-   ```
-   Note: Make sure the provider configuration includes `validate_server_certificate = false` for local Docker containers
-3. Navigate to the example directory and run:
-   ```bash
-   cd examples/privileges  # or other example directory
-   terraform init
-   terraform plan
-   terraform apply
-   terraform plan  # Check for drift - should show no changes
-   terraform show
-   terraform destroy
-   ```
-
 **Important**: Always check Exasol documentation at https://docs.exasol.com if any database-specific behavior is unclear
+
+**Note**: The `examples/` directory contains per-resource examples consumed by `tfplugindocs` to generate `docs/`. Do not use them for manual testing; use the `test/` directory instead.
 
 ### Handling Drift
 
@@ -279,14 +255,10 @@ Key SQL patterns used:
 
 4. **Connection Grants**: Use `EXA_DBA_CONNECTION_PRIVS` for reads, not `EXA_DBA_CONNECTIONS`.
 
-5. **Legacy Grant Resource**: `grant_resource.go` exists for backward compatibility but new code should use specific grant resources (system_privilege, object_privilege, role_grant, connection_grant).
+5. **Grant Resources**: Use the specific grant resources (system_privilege, object_privilege, role_grant, connection_grant). The legacy `exasol_grant` resource was removed.
 
 6. **Schema Ownership**: Ownership transfer happens after schema creation via `ALTER SCHEMA ... CHANGE OWNER`.
 
-7. **No Test Files**: The repository has no automated tests. All testing must be done manually with actual Exasol database instances.
+7. **Testing**: Unit tests (`make test`) and acceptance tests (`make test-integration`, requires running Exasol). Acceptance tests use `terraform-plugin-testing` framework with create, rename, import, and CheckDestroy coverage.
 
-8. **Transaction Collision Prevention**: The provider uses a global mutex (`internal/resources/delete_mutex.go`) to serialize all delete operations. This prevents transaction collision errors (SQL error code 40001) that occur when multiple REVOKE/DROP statements execute simultaneously.
-
-   **Current implementation**: All Delete methods call `lockDelete()` / `defer unlockDelete()` to serialize operations.
-
-   **Future improvement**: Replace the global mutex with retry logic and exponential backoff. See `TODO.md` for implementation details. This would allow parallel deletes while gracefully handling occasional collisions.
+8. **Transaction Collision Prevention**: The provider uses a global mutex (`internal/resources/delete_mutex.go`) to serialize all delete operations. This prevents transaction collision errors (SQL error code 40001) that occur when multiple REVOKE/DROP statements execute simultaneously. All Delete methods call `lockDelete()` / `defer unlockDelete()`.

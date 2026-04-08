@@ -12,7 +12,7 @@ func TestIsValidIdentifier(t *testing.T) {
 		{"lowercase", "my_user", true},
 		{"with digits", "USER123", true},
 		{"with dots", "SCHEMA.TABLE", true},
-		{"with spaces", "my user", true},    // quoted identifiers allow spaces
+		{"with spaces", "my user", true},                // quoted identifiers allow spaces
 		{"with special chars", "user@domain.com", true}, // quoted identifiers allow special chars
 		{"empty string", "", false},
 	}

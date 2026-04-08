@@ -1,9 +1,10 @@
-.PHONY: build test fmt vet clean install-local docs lint help
+.PHONY: build test fmt vet clean install-local docs docs-validate lint help
 
 # Variables
 BINARY_NAME=terraform-provider-exasol
-PROVIDER_NAME=exasol/terraform-provider-exasol
+PROVIDER_NAME=exasol/exasol
 VERSION?=$(shell grep 'var version = ' main.go | sed 's/.*"\(.*\)".*/\1/')
+TFPLUGINDOCS_VERSION?=v0.24.0
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -51,8 +52,16 @@ install-local: build ## Install provider locally for testing
 
 release: ## Build release binaries
 	@echo "Building release binaries..."
-	@goreleaser build --snapshot --rm-dist
+	@goreleaser build --snapshot --clean
 
-check: fmt vet lint test ## Run all checks
+docs: ## Generate provider documentation
+	@echo "Generating docs..."
+	@go run github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs@$(TFPLUGINDOCS_VERSION) generate
+
+docs-validate: ## Validate docs match provider schema
+	@echo "Validating docs..."
+	@go run github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs@$(TFPLUGINDOCS_VERSION) validate
+
+check: fmt vet lint test docs-validate ## Run all checks
 
 all: clean check build ## Run all steps

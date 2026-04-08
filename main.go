@@ -11,7 +11,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 )
 
-var version = "0.1.8"
+var version = "0.2.0"
 
 func main() {
 	var debug bool
@@ -19,8 +19,7 @@ func main() {
 	flag.Parse()
 
 	opts := providerserver.ServeOpts{
-		// MUST match Terraform's fully-qualified address format: registry.terraform.io/namespace/name
-		Address: "registry.terraform.io/exasol/terraform-provider-exasol",
+		Address: "registry.terraform.io/exasol/exasol",
 		Debug:   debug,
 	}
 

@@ -1,0 +1,1 @@
+terraform import exasol_schema.analytics ANALYTICS

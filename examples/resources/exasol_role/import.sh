@@ -1,0 +1,1 @@
+terraform import exasol_role.analyst ANALYST_ROLE
