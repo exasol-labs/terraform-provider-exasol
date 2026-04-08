@@ -84,20 +84,37 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Check if release needed
+        id: check
+        run: |
+          ver=$(grep -Po 'var version\s*=\s*"\K[0-9]+\.[0-9]+\.[0-9]+' main.go)
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          if gh release view "v$ver" &>/dev/null; then
+            echo "Release v$ver already exists, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version v$ver detected, proceeding with release"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: actions/setup-go@v6
+        if: steps.check.outputs.skip == 'false'
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      - name: Extract version and create/update tag
+      - name: Create tag
+        if: steps.check.outputs.skip == 'false'
         run: |
-          ver=$(grep -Po 'var version\s*=\s*"\K[0-9]+\.[0-9]+\.[0-9]+' main.go)
-          echo "Building version: $ver"
+          ver=${{ steps.check.outputs.version }}
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git tag -f "v$ver" -m "Release v$ver"
-          git push -f origin "v$ver"
+          git tag "v$ver" -m "Release v$ver"
+          git push origin "v$ver"
 
       - name: Run goreleaser
+        if: steps.check.outputs.skip == 'false'
         uses: goreleaser/goreleaser-action@v6
         with:
           version: latest
