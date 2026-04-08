@@ -11,6 +11,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - CI no longer triggers a release on every push to main; releases only when version is bumped
+- Update exasol-driver-go 1.0.14 to 1.0.16
+- Update terraform-plugin-framework 1.16.0 to 1.19.0
+- Update terraform-plugin-log 0.9.0 to 0.10.0
+
+### Security
+- Bump google.golang.org/grpc 1.75.1 to 1.79.3 (authorization bypass fix)
 
 ## [0.1.8] - 2025-12-18
 
