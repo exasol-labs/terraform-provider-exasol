@@ -250,17 +250,17 @@ func buildCreateConnectionSQL(m connectionModel) (string, error) {
 	escapedTo := escapeStringLiteral(m.To.ValueString())
 
 	var stmt strings.Builder
-	stmt.WriteString(fmt.Sprintf(`CREATE CONNECTION "%s" TO '%s'`, upName, escapedTo))
+	fmt.Fprintf(&stmt, `CREATE CONNECTION "%s" TO '%s'`, upName, escapedTo)
 
 	// Add credentials if provided
 	if !m.User.IsNull() && !m.User.IsUnknown() && m.User.ValueString() != "" {
 		escapedUser := escapeStringLiteral(m.User.ValueString())
-		stmt.WriteString(fmt.Sprintf(` USER '%s'`, escapedUser))
+		fmt.Fprintf(&stmt, ` USER '%s'`, escapedUser)
 	}
 
 	if !m.Password.IsNull() && !m.Password.IsUnknown() && m.Password.ValueString() != "" {
 		escapedPwd := escapeStringLiteral(m.Password.ValueString())
-		stmt.WriteString(fmt.Sprintf(` IDENTIFIED BY '%s'`, escapedPwd))
+		fmt.Fprintf(&stmt, ` IDENTIFIED BY '%s'`, escapedPwd)
 	}
 
 	return stmt.String(), nil
@@ -278,17 +278,17 @@ func buildAlterConnectionSQL(m connectionModel) (string, error) {
 	escapedTo := escapeStringLiteral(m.To.ValueString())
 
 	var stmt strings.Builder
-	stmt.WriteString(fmt.Sprintf(`ALTER CONNECTION "%s" TO '%s'`, upName, escapedTo))
+	fmt.Fprintf(&stmt, `ALTER CONNECTION "%s" TO '%s'`, upName, escapedTo)
 
 	// Add credentials if provided
 	if !m.User.IsNull() && !m.User.IsUnknown() && m.User.ValueString() != "" {
 		escapedUser := escapeStringLiteral(m.User.ValueString())
-		stmt.WriteString(fmt.Sprintf(` USER '%s'`, escapedUser))
+		fmt.Fprintf(&stmt, ` USER '%s'`, escapedUser)
 	}
 
 	if !m.Password.IsNull() && !m.Password.IsUnknown() && m.Password.ValueString() != "" {
 		escapedPwd := escapeStringLiteral(m.Password.ValueString())
-		stmt.WriteString(fmt.Sprintf(` IDENTIFIED BY '%s'`, escapedPwd))
+		fmt.Fprintf(&stmt, ` IDENTIFIED BY '%s'`, escapedPwd)
 	}
 
 	return stmt.String(), nil
