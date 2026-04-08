@@ -34,6 +34,7 @@ func (p *ExasolProvider) Schema(
 	resp *provider.SchemaResponse,
 ) {
 	resp.Schema = schema.Schema{
+		Description: "Manage Exasol database resources: users, roles, schemas, connections, and privileges.",
 		Attributes: map[string]schema.Attribute{
 			"host": schema.StringAttribute{
 				Required:    true,
@@ -50,7 +51,7 @@ func (p *ExasolProvider) Schema(
 			"password": schema.StringAttribute{
 				Required:    true,
 				Sensitive:   true,
-				Description: "Exasol password.",
+				Description: "Exasol password or Personal Access Token (PAT). Tokens starting with exa_pat_ are detected automatically.",
 			},
 			"validate_server_certificate": schema.BoolAttribute{
 				Optional:    true,
@@ -80,7 +81,6 @@ func (p *ExasolProvider) Resources(_ context.Context) []func() resource.Resource
 	return []func() resource.Resource{
 		resources.NewConnectionResource,
 		resources.NewConnectionGrantResource,
-		resources.NewGrantResource, // Legacy - use specific grant resources instead
 		resources.NewObjectPrivilegeResource,
 		resources.NewRoleGrantResource,
 		resources.NewRoleResource,

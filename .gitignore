@@ -70,9 +70,8 @@ Thumbs.db
 # Logs
 *.log
 
-# Generated docs / files
+# Generated files
 doc.go
-docs/
 generated/
 
 # Python (not part of this Go project, used only for temporary tasks)

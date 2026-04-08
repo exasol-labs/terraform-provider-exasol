@@ -1,0 +1,1 @@
+terraform import exasol_user.analyst ANALYST_USER

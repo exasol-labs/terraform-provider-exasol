@@ -1,182 +1,98 @@
 # Terraform Provider for Exasol
 
-A Terraform provider for managing Exasol database resources.
+A Terraform provider for managing Exasol database resources: users, roles, schemas, connections, and privileges.
 
-## ⚠️ Warning
-
-**Please note that this is an open source project which is not officially supported by Exasol. We will try to help you as much as possible, but can't guarantee anything since this is not an official Exasol product.**
-
-## Features
-
-- **User management** - Create and manage database users with various authentication methods
-- **Role management** - Define and manage database roles
-- **Schema management** - Create and configure database schemas with ownership control
-- **Connection management** - Manage external connections (S3, FTP, JDBC, etc.)
-- **Privilege management** - Four dedicated resources for clear privilege management:
-  - `exasol_system_privilege` - System-level privileges (CREATE SESSION, CREATE TABLE, etc.)
-  - `exasol_object_privilege` - Object-level privileges (SELECT, INSERT, etc. on tables/schemas/views)
-  - `exasol_role_grant` - Grant roles to users or other roles
-  - `exasol_connection_grant` - Grant connection access to users or roles
+> **Warning**: This is an open source project not officially supported by Exasol. We will try to help you as much as possible, but can't guarantee anything since this is not an official Exasol product.
 
 ## Installation
 
-### Using Terraform Registry
-
-```hcl
-terraform {
-  required_providers {
-    exasol = {
-      source  = "registry.terraform.io/exasol/terraform-provider-exasol"
-      version = "~> 0.1.1"
-    }
-  }
-}
-```
-
-### Local Development
-
-Clone the repository and install the provider locally:
+This provider is not published to the Terraform Registry. Install it from [GitHub Releases](https://github.com/exasol-labs/terraform-provider-exasol/releases):
 
 ```bash
-git clone https://github.com/exasol/terraform-provider-exasol.git
-cd terraform-provider-exasol
-make install-local
+VERSION=0.2.0
+OS=darwin  # or linux
+ARCH=arm64 # or amd64
+
+mkdir -p ~/.terraform.d/plugins/registry.terraform.io/exasol/exasol/${VERSION}/${OS}_${ARCH}
+unzip terraform-provider-exasol_${VERSION}_${OS}_${ARCH}.zip \
+  -d ~/.terraform.d/plugins/registry.terraform.io/exasol/exasol/${VERSION}/${OS}_${ARCH}/
 ```
 
-Configure your Terraform to use the local provider:
+Then reference it in your Terraform configuration:
 
 ```hcl
 terraform {
   required_providers {
     exasol = {
-      source  = "local/exasol/terraform-provider-exasol"
+      source  = "exasol/exasol"
+      version = "~> 0.2.0"
     }
   }
 }
 ```
 
-## Usage
+## Provider Configuration
 
 ```hcl
 provider "exasol" {
-  host     = "localhost"
-  port     = 8563
+  host     = "exasol.example.com"
+  port     = 8563                        # default
   user     = "sys"
   password = "exasol"
+  validate_server_certificate = true     # default; set false for self-signed certs
 }
+```
 
-resource "exasol_user" "example" {
-  name      = "testuser"
-  auth_type = "PASSWORD"
-  password  = "password123"
-}
+The provider also accepts Exasol Personal Access Tokens (PAT) in the `password` field. Tokens starting with `exa_pat_` are automatically detected.
 
+## Resources
+
+| Resource | Description |
+|---|---|
+| [`exasol_user`](docs/resources/user.md) | Database users (password, LDAP, or OpenID auth) |
+| [`exasol_role`](docs/resources/role.md) | Database roles |
+| [`exasol_schema`](docs/resources/schema.md) | Schemas with optional ownership control |
+| [`exasol_connection`](docs/resources/connection.md) | External connections (S3, FTP, JDBC, etc.) |
+| [`exasol_system_privilege`](docs/resources/system_privilege.md) | System-level privileges (CREATE SESSION, etc.) |
+| [`exasol_object_privilege`](docs/resources/object_privilege.md) | Object-level privileges (SELECT, INSERT, etc.) |
+| [`exasol_role_grant`](docs/resources/role_grant.md) | Role-to-user or role-to-role grants |
+| [`exasol_connection_grant`](docs/resources/connection_grant.md) | Connection access grants |
+
+All resources support in-place rename and `terraform import`. See individual resource docs for usage examples and import syntax.
+
+## Quick Example
+
+```hcl
 resource "exasol_role" "analyst" {
   name = "ANALYST_ROLE"
 }
 
-# Schema with declarative ownership (NEW in v0.1.1)
 resource "exasol_schema" "analytics" {
   name  = "ANALYTICS"
-  owner = exasol_role.analyst.name  # Automatically transfers ownership
+  owner = exasol_role.analyst.name
 }
 
-resource "exasol_connection" "s3" {
-  name     = "MY_S3_BUCKET"
-  to       = "https://my-bucket.s3.us-east-1.amazonaws.com"
-  user     = "AWS_ACCESS_KEY"
-  password = "AWS_SECRET_KEY"
-}
-
-# Grant connection access (NEW in v0.1.1)
-resource "exasol_connection_grant" "analyst_s3" {
-  connection_name = exasol_connection.s3.name
-  grantee         = exasol_role.analyst.name
-}
-
-# Grant system privilege
-resource "exasol_system_privilege" "create_session" {
-  grantee   = exasol_user.example.name
-  privilege = "CREATE SESSION"
-}
-
-# Grant system privilege with admin option
-resource "exasol_system_privilege" "use_any_schema" {
-  grantee           = exasol_role.analyst.name
-  privilege         = "USE ANY SCHEMA"
-  with_admin_option = true
-}
-
-# Grant multiple object privileges (can be a single privilege or list)
 resource "exasol_object_privilege" "schema_access" {
   grantee     = exasol_role.analyst.name
-  privileges  = ["USAGE", "SELECT"]  # List of privileges
+  privileges  = ["USAGE", "SELECT"]
   object_type = "SCHEMA"
   object_name = exasol_schema.analytics.name
 }
-
-# Grant role to user
-resource "exasol_role_grant" "user_role" {
-  role    = exasol_role.analyst.name
-  grantee = exasol_user.example.name
-}
-
-# Grant role with admin option (allows grantee to grant role to others)
-resource "exasol_role_grant" "user_role_admin" {
-  role              = exasol_role.analyst.name
-  grantee           = exasol_user.example.name
-  with_admin_option = true
-}
 ```
-
-## Examples
-
-See the [examples/](examples/) directory for complete examples of each resource type:
-- [examples/privileges/](examples/privileges/) - System privileges, object privileges, and role grants
-- [examples/connections/](examples/connections/) - Various connection types (S3, FTP, JDBC, etc.)
-- [examples/basic/](examples/basic/) - Basic resource usage
-
-## Available Resources
-
-- `exasol_user` - Manage database users
-- `exasol_role` - Manage database roles
-- `exasol_schema` - Manage database schemas
-- `exasol_connection` - Manage external connections
-- `exasol_system_privilege` - Grant system-level privileges
-- `exasol_object_privilege` - Grant object-level privileges
-- `exasol_role_grant` - Grant roles to users or other roles
-- `exasol_connection_grant` - Grant connection access to users or roles
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Development
 
-### Prerequisites
-
-- Go 1.21+
-- Terraform 1.0+
-- Make
-
-### Building
-
 ```bash
-make build
+git clone https://github.com/exasol-labs/terraform-provider-exasol.git
+cd terraform-provider-exasol
+make build             # Build the provider
+make test              # Unit tests
+make test-integration  # Requires running Exasol database
+make install-local     # Install for local Terraform testing
 ```
 
-### Testing
-
-```bash
-make test
-```
-
-### Installing Locally
-
-```bash
-make install-local
-```
+Requires Go 1.25+, Terraform 1.0+, and Make.
 
 ## License
 
-See [LICENSE](LICENSE) file for details.
+See [LICENSE](LICENSE) file.

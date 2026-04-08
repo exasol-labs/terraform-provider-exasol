@@ -2,7 +2,6 @@ terraform {
   required_providers {
     exasol = {
       source  = "local/exasol/exasol"
-      version = "0.1.5"
     }
   }
 }

@@ -1,0 +1,1 @@
+terraform import exasol_connection.s3 MY_S3_BUCKET
