@@ -469,6 +469,38 @@ resource "exasol_connection" "test" {
 	})
 }
 
+// --- Connection with credentials: verify user round-trips through import ---
+
+func TestAccConnection_WithCredentials(t *testing.T) {
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckConnectionDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: providerConfig() + `
+resource "exasol_connection" "cred" {
+  name     = "ACC_CONN_CRED"
+  to       = "https://bucket.s3.amazonaws.com"
+  user     = "AKIAIOSFODNN7EXAMPLE"
+  password = "wJalrXUtnFEMI"
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_connection.cred", "to", "https://bucket.s3.amazonaws.com"),
+					resource.TestCheckResourceAttr("exasol_connection.cred", "user", "AKIAIOSFODNN7EXAMPLE"),
+				),
+			},
+			// Import: verify to and user are read back from DB
+			{
+				ResourceName:            "exasol_connection.cred",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"password"},
+			},
+		},
+	})
+}
+
 // --- System Privilege: grant, admin option toggle, import ---
 
 func TestAccSystemPrivilege_FullLifecycle(t *testing.T) {

@@ -151,12 +151,16 @@ func (r *ConnectionResource) Read(ctx context.Context, req resource.ReadRequest,
 	}
 	state.ID = types.StringValue(strings.ToUpper(state.Name.ValueString()))
 
-	// Populate readable attributes from DB
+	// Populate readable attributes from DB.
+	// Always set from DB to detect external changes (drift).
 	if connString.Valid {
 		state.To = types.StringValue(connString.String)
 	}
 	if userName.Valid && userName.String != "" {
 		state.User = types.StringValue(userName.String)
+	} else {
+		// DB has no user - clear it so drift is detected if user was removed externally
+		state.User = types.StringNull()
 	}
 	// Password is not exposed by Exasol - keep whatever is in state
 
