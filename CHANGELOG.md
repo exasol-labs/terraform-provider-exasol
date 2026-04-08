@@ -36,6 +36,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Delete `TODO.md` (retry logic deprioritized, mutex documented in CLAUDE.md)
 - Trim `test/README.md`: remove references to non-existent docs, point to acceptance tests
 - Include `terraform-registry-manifest.json` in goreleaser release artifacts (registry-ready)
+- Update all CI GitHub Actions to latest major versions (checkout v6, cache v5, setup-terraform v4, codecov v6, golangci-lint v9, goreleaser v7)
 
 ### Removed
 - `exasol_grant` resource (use `exasol_system_privilege`, `exasol_object_privilege`, `exasol_role_grant`, `exasol_connection_grant` instead)
