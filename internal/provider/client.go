@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"strings"
+	"time"
 
 	"terraform-provider-exasol/internal/exasolclient"
 
@@ -36,6 +37,13 @@ func NewClient(ctx context.Context, c *ProviderConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Tune connection pool for Terraform's parallel operations (default parallelism=10).
+	// Go's default MaxIdleConns=2 causes constant reconnection churn under parallel load.
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
 	if err := db.PingContext(ctx); err != nil {
 		return nil, err
 	}
