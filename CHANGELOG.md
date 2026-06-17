@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Update `github.com/cloudflare/circl` 1.6.1 to 1.6.3 (transitive dependency; ecc/p384 scalar-multiplication fix)
 - README installation rewritten for the Terraform Registry flow (`source = "exasol-labs/exasol"`, `terraform init`); fix stale `~> 0.2.0` version pin
 - Provider registry address in `main.go` corrected to `registry.terraform.io/exasol-labs/exasol` (was `exasol/exasol`) to match the `exasol-labs` publishing namespace
+- Local dev install namespace aligned to `local/exasol-labs/exasol` (Makefile `PROVIDER_NAME`, `test/*.tf` source blocks, CLAUDE.md) so it mirrors the registry namespace
 
 ### Removed
 - End-user local/manual install path and `install.sh` (the provider now installs from the Terraform Registry; `make install-local` is retained for development)
