@@ -19,7 +19,7 @@ func main() {
 	flag.Parse()
 
 	opts := providerserver.ServeOpts{
-		Address: "registry.terraform.io/exasol/exasol",
+		Address: "registry.terraform.io/exasol-labs/exasol",
 		Debug:   debug,
 	}
 

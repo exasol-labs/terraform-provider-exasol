@@ -6,34 +6,18 @@ A Terraform provider for managing Exasol database resources: users, roles, schem
 
 ## Installation
 
-This provider is published on the [Terraform Registry](https://registry.terraform.io/providers/exasol/exasol/latest). Declare it in your configuration and run `terraform init`:
+This provider is published on the [Terraform Registry](https://registry.terraform.io/providers/exasol-labs/exasol/latest). Declare it in your configuration and run `terraform init`:
 
 ```hcl
 terraform {
   required_providers {
     exasol = {
-      source  = "exasol/exasol"
+      source  = "exasol-labs/exasol"
       version = "~> 0.2"
     }
   }
 }
 ```
-
-<details>
-<summary>Manual install from GitHub Releases (air-gapped / pre-release)</summary>
-
-Download the zip for your platform from [Releases](https://github.com/exasol-labs/terraform-provider-exasol/releases) and unzip it into:
-
-```
-~/.terraform.d/plugins/registry.terraform.io/exasol/exasol/<version>/<os>_<arch>/
-```
-
-Or use the install script (Mac ARM / Linux x86):
-
-```bash
-curl -sfL https://raw.githubusercontent.com/exasol-labs/terraform-provider-exasol/main/install.sh | bash
-```
-</details>
 
 ## Provider Configuration
 

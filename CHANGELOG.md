@@ -13,7 +13,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - Update `github.com/cloudflare/circl` 1.6.1 to 1.6.3 (transitive dependency; ecc/p384 scalar-multiplication fix)
-- README installation rewritten for the Terraform Registry flow (`terraform init` from `source = "exasol/exasol"`); manual GitHub-Releases install demoted to a fallback; fix stale `~> 0.2.0` version pin
+- README installation rewritten for the Terraform Registry flow (`source = "exasol-labs/exasol"`, `terraform init`); fix stale `~> 0.2.0` version pin
+- Provider registry address in `main.go` corrected to `registry.terraform.io/exasol-labs/exasol` (was `exasol/exasol`) to match the `exasol-labs` publishing namespace
+
+### Removed
+- End-user local/manual install path and `install.sh` (the provider now installs from the Terraform Registry; `make install-local` is retained for development)
 
 ## [0.2.0] - 2026-04-08
 
