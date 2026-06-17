@@ -4,7 +4,7 @@
 terraform {
   required_providers {
     exasol = {
-      source  = "local/exasol/exasol"
+      source  = "local/exasol-labs/exasol"
     }
   }
 }

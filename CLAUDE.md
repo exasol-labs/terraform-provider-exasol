@@ -127,7 +127,7 @@ After `make install-local`, configure Terraform to use the local build:
 terraform {
   required_providers {
     exasol = {
-      source = "local/exasol/exasol"
+      source = "local/exasol-labs/exasol"
     }
   }
 }

@@ -2,7 +2,7 @@
 
 # Variables
 BINARY_NAME=terraform-provider-exasol
-PROVIDER_NAME=exasol/exasol
+PROVIDER_NAME=exasol-labs/exasol
 VERSION?=$(shell grep 'var version = ' main.go | sed 's/.*"\(.*\)".*/\1/')
 TFPLUGINDOCS_VERSION?=v0.24.0
 

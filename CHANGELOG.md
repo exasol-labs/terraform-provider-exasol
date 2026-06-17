@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] - 2026-06-17
+
+### Added
+- GPG signing of the `SHA256SUMS` checksum file in goreleaser (`signs:` block) to produce the `SHA256SUMS.sig` required for Terraform Registry publishing
+- GPG key import (`crazy-max/ghaction-import-gpg`) in the release job, feeding `GPG_FINGERPRINT` to goreleaser
+- Release binaries now built for the full Terraform Registry platform matrix (linux, darwin, windows, freebsd across `386`/`amd64`/`arm`/`arm64`)
+
+### Changed
+- Update `github.com/cloudflare/circl` 1.6.1 to 1.6.3 (transitive dependency; ecc/p384 scalar-multiplication fix)
+- README installation rewritten for the Terraform Registry flow (`source = "exasol-labs/exasol"`, `terraform init`); fix stale `~> 0.2.0` version pin
+- Provider registry address in `main.go` corrected to `registry.terraform.io/exasol-labs/exasol` (was `exasol/exasol`) to match the `exasol-labs` publishing namespace
+- Local dev install namespace aligned to `local/exasol-labs/exasol` (Makefile `PROVIDER_NAME`, `test/*.tf` source blocks, CLAUDE.md) so it mirrors the registry namespace
+
+### Removed
+- End-user local/manual install path and `install.sh` (the provider now installs from the Terraform Registry; `make install-local` is retained for development)
+
 ## [0.2.0] - 2026-04-08
 
 ### Fixed

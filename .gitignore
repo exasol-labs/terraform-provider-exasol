@@ -53,6 +53,7 @@ crash.log
 # IDEs and editors
 .vscode/
 .idea/
+.serena/
 *.iml
 *.ipr
 *.iws
