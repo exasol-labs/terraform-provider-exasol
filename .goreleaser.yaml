@@ -57,6 +57,3 @@ release:
       name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'
   prerelease: auto
   name_template: "v{{ .Version }}"
-
-changelog:
-  disable: true
