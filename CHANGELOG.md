@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - Update `github.com/cloudflare/circl` 1.6.1 to 1.6.3 (transitive dependency; ecc/p384 scalar-multiplication fix)
+- README installation rewritten for the Terraform Registry flow (`terraform init` from `source = "exasol/exasol"`); manual GitHub-Releases install demoted to a fallback; fix stale `~> 0.2.0` version pin
 
 ## [0.2.0] - 2026-04-08
 
