@@ -127,6 +127,20 @@ jobs:
           ver=${{ steps.check.outputs.version }}
           awk "/^## \\[${ver}\\]/{found=1; next} /^## \\[/{if(found) exit} found" CHANGELOG.md > /tmp/release-notes.md
 
+      # GPG signing is required by the Terraform Registry (SHA256SUMS.sig).
+      # Tagging and releasing happen in this single job, so we never rely on a
+      # tag push triggering another workflow (GITHUB_TOKEN-pushed tags do not
+      # trigger workflows). The fingerprint feeds goreleaser's signs block.
+      - name: Import GPG key
+        id: import_gpg
+        if: steps.check.outputs.skip == 'false'
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+
       - name: Run goreleaser
         if: steps.check.outputs.skip == 'false'
         uses: goreleaser/goreleaser-action@v7
@@ -135,3 +149,4 @@ jobs:
           args: release --clean --release-header-file /tmp/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}

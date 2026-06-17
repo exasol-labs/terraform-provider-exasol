@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] - 2026-06-17
+
+### Added
+- GPG signing of the `SHA256SUMS` checksum file in goreleaser (`signs:` block) to produce the `SHA256SUMS.sig` required for Terraform Registry publishing
+- GPG key import (`crazy-max/ghaction-import-gpg`) in the release job, feeding `GPG_FINGERPRINT` to goreleaser
+- Release binaries now built for the full Terraform Registry platform matrix (linux, darwin, windows, freebsd across `386`/`amd64`/`arm`/`arm64`)
+
 ## [0.2.0] - 2026-04-08
 
 ### Fixed
