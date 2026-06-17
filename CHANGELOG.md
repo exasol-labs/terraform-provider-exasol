@@ -11,6 +11,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - GPG key import (`crazy-max/ghaction-import-gpg`) in the release job, feeding `GPG_FINGERPRINT` to goreleaser
 - Release binaries now built for the full Terraform Registry platform matrix (linux, darwin, windows, freebsd across `386`/`amd64`/`arm`/`arm64`)
 
+### Changed
+- Update `github.com/cloudflare/circl` 1.6.1 to 1.6.3 (transitive dependency; ecc/p384 scalar-multiplication fix)
+
 ## [0.2.0] - 2026-04-08
 
 ### Fixed
