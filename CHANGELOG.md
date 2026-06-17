@@ -20,6 +20,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Removed
 - End-user local/manual install path and `install.sh` (the provider now installs from the Terraform Registry; `make install-local` is retained for development)
 
+### Fixed
+- Release workflow used the non-existent goreleaser flag `--release-header-file`; corrected to `--release-notes` so the GitHub release body is populated from the `CHANGELOG.md` section
+
 ## [0.2.0] - 2026-04-08
 
 ### Fixed
