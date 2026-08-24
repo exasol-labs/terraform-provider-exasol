@@ -46,6 +46,9 @@ func LoadConfig(ctx context.Context, req provider.ConfigureRequest) (*ProviderCo
 	}
 	if !cfg.ConnectTimeout.IsNull() {
 		out.ConnectTimeout = cfg.ConnectTimeout.ValueInt64()
+		if out.ConnectTimeout < 0 {
+			out.ConnectTimeout = 0
+		}
 	}
 
 	return out, diags

@@ -52,15 +52,24 @@ func NewClient(ctx context.Context, c *ProviderConfig) (*Client, error) {
 		if err == nil {
 			return &Client{DB: db}, nil
 		}
-		if time.Now().After(deadline) || ctx.Err() != nil {
+		if ctx.Err() != nil {
+			_ = db.Close()
+			return nil, ctx.Err()
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			_ = db.Close()
 			return nil, err
+		}
+		wait := 10 * time.Second
+		if remaining < wait {
+			wait = remaining
 		}
 		select {
 		case <-ctx.Done():
 			_ = db.Close()
 			return nil, ctx.Err()
-		case <-time.After(10 * time.Second):
+		case <-time.After(wait):
 		}
 	}
 }
