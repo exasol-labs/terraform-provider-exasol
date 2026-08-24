@@ -3,6 +3,8 @@ package provider
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"net"
 	"strings"
 	"time"
 
@@ -44,9 +46,56 @@ func NewClient(ctx context.Context, c *ProviderConfig) (*Client, error) {
 	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	if err := db.PingContext(ctx); err != nil {
-		return nil, err
+	// Retry the initial ping until connect_timeout elapses, so a run rides out
+	// IP-allowlist propagation delays instead of failing on the first attempt.
+	// Each attempt is bounded at retryInterval (or the time remaining, if
+	// shorter) so a hanging dial is re-tried with a fresh dial every interval,
+	// and a new attempt starts each interval regardless of how fast the
+	// previous one failed. connect_timeout = 0 means a single bounded attempt.
+	// Only network errors are retried; anything else (failed login, invalid
+	// certificate) surfaces immediately.
+	const retryInterval = 10 * time.Second
+	deadline := time.Now().Add(time.Duration(c.ConnectTimeout) * time.Second)
+	for {
+		attemptStart := time.Now()
+		window := retryInterval
+		if r := time.Until(deadline); r > 0 && r < window {
+			window = r
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, window)
+		err = db.PingContext(attemptCtx)
+		cancel()
+		if err == nil {
+			return &Client{DB: db}, nil
+		}
+		if ctx.Err() != nil {
+			_ = db.Close()
+			return nil, ctx.Err()
+		}
+		if !isRetryableConnectError(err) || !time.Now().Before(deadline) {
+			_ = db.Close()
+			return nil, err
+		}
+		wait := retryInterval - time.Since(attemptStart)
+		if r := time.Until(deadline); r < wait {
+			wait = r
+		}
+		if wait > 0 {
+			select {
+			case <-ctx.Done():
+				_ = db.Close()
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
 	}
+}
 
-	return &Client{DB: db}, nil
+// isRetryableConnectError reports whether a connect failure is worth retrying.
+// Network-level failures (dial timeout, connection refused, host unreachable)
+// and our per-attempt deadline all satisfy net.Error; authentication and TLS
+// certificate errors do not, and fail fast.
+func isRetryableConnectError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
