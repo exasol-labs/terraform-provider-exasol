@@ -44,11 +44,21 @@ func NewClient(ctx context.Context, c *ProviderConfig) (*Client, error) {
 	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	// Retry the initial ping until connect_timeout elapses: each ping dials a
-	// fresh connection, so this rides out IP-allowlist propagation delays.
+	// Retry the initial ping until connect_timeout elapses, so a run rides out
+	// IP-allowlist propagation delays instead of failing on the first attempt.
+	// Each attempt is bounded by its own context (the time remaining, at least
+	// retryInterval), so a hanging dial cannot overshoot the deadline by more
+	// than retryInterval.
+	const retryInterval = 10 * time.Second
 	deadline := time.Now().Add(time.Duration(c.ConnectTimeout) * time.Second)
 	for {
-		err = db.PingContext(ctx)
+		attemptWindow := time.Until(deadline)
+		if attemptWindow < retryInterval {
+			attemptWindow = retryInterval
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptWindow)
+		err = db.PingContext(attemptCtx)
+		cancel()
 		if err == nil {
 			return &Client{DB: db}, nil
 		}
@@ -61,7 +71,7 @@ func NewClient(ctx context.Context, c *ProviderConfig) (*Client, error) {
 			_ = db.Close()
 			return nil, err
 		}
-		wait := 10 * time.Second
+		wait := retryInterval
 		if remaining < wait {
 			wait = remaining
 		}

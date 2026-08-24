@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [0.2.3] - 2026-08-24
 
 ### Added
-- New optional provider attribute `connect_timeout` (seconds, default 60): the initial connection ping is retried every 10 seconds until the timeout elapses. Each retry dials a fresh connection, so runs no longer fail while a freshly added IP-allowlist entry is still propagating on Exasol SaaS
+- New optional provider attribute `connect_timeout` (seconds, default 60): the initial connection ping is retried every 10 seconds until the timeout elapses, with each attempt bounded by its own context. Runs no longer fail while a freshly added IP-allowlist entry is still propagating on Exasol SaaS
 
 ### Security
 - Update `google.golang.org/grpc` 1.79.3 to 1.82.1 (xDS RBAC and HTTP/2 vulnerabilities)
