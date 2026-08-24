@@ -3,6 +3,8 @@ package provider
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"net"
 	"strings"
 	"time"
 
@@ -46,17 +48,21 @@ func NewClient(ctx context.Context, c *ProviderConfig) (*Client, error) {
 
 	// Retry the initial ping until connect_timeout elapses, so a run rides out
 	// IP-allowlist propagation delays instead of failing on the first attempt.
-	// Each attempt is bounded by its own context (the time remaining, at least
-	// retryInterval), so a hanging dial cannot overshoot the deadline by more
-	// than retryInterval.
+	// Each attempt is bounded at retryInterval (or the time remaining, if
+	// shorter) so a hanging dial is re-tried with a fresh dial every interval,
+	// and a new attempt starts each interval regardless of how fast the
+	// previous one failed. connect_timeout = 0 means a single bounded attempt.
+	// Only network errors are retried; anything else (failed login, invalid
+	// certificate) surfaces immediately.
 	const retryInterval = 10 * time.Second
 	deadline := time.Now().Add(time.Duration(c.ConnectTimeout) * time.Second)
 	for {
-		attemptWindow := time.Until(deadline)
-		if attemptWindow < retryInterval {
-			attemptWindow = retryInterval
+		attemptStart := time.Now()
+		window := retryInterval
+		if r := time.Until(deadline); r > 0 && r < window {
+			window = r
 		}
-		attemptCtx, cancel := context.WithTimeout(ctx, attemptWindow)
+		attemptCtx, cancel := context.WithTimeout(ctx, window)
 		err = db.PingContext(attemptCtx)
 		cancel()
 		if err == nil {
@@ -66,20 +72,30 @@ func NewClient(ctx context.Context, c *ProviderConfig) (*Client, error) {
 			_ = db.Close()
 			return nil, ctx.Err()
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
+		if !isRetryableConnectError(err) || !time.Now().Before(deadline) {
 			_ = db.Close()
 			return nil, err
 		}
-		wait := retryInterval
-		if remaining < wait {
-			wait = remaining
+		wait := retryInterval - time.Since(attemptStart)
+		if r := time.Until(deadline); r < wait {
+			wait = r
 		}
-		select {
-		case <-ctx.Done():
-			_ = db.Close()
-			return nil, ctx.Err()
-		case <-time.After(wait):
+		if wait > 0 {
+			select {
+			case <-ctx.Done():
+				_ = db.Close()
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
 		}
 	}
+}
+
+// isRetryableConnectError reports whether a connect failure is worth retrying.
+// Network-level failures (dial timeout, connection refused, host unreachable)
+// and our per-attempt deadline all satisfy net.Error; authentication and TLS
+// certificate errors do not, and fail fast.
+func isRetryableConnectError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }

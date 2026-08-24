@@ -62,6 +62,6 @@ provider "exasol" {
 
 ### Optional
 
-- `connect_timeout` (Number) Total time in seconds to keep retrying the initial connection before failing. Useful when an IP allowlist entry needs time to propagate. Default 60.
+- `connect_timeout` (Number) Total time in seconds to keep retrying the initial connection on network errors before failing. Useful when an IP allowlist entry needs time to propagate. 0 disables retrying (single attempt). Default 60.
 - `port` (Number) Exasol port. Default 8563.
 - `validate_server_certificate` (Boolean) Validate server TLS certificate. Default true.
