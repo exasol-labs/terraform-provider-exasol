@@ -14,6 +14,7 @@ type ProviderConfig struct {
 	User                      string
 	Password                  string
 	ValidateServerCertificate bool
+	ConnectTimeout            int64
 }
 
 func LoadConfig(ctx context.Context, req provider.ConfigureRequest) (*ProviderConfig, diag.Diagnostics) {
@@ -25,6 +26,7 @@ func LoadConfig(ctx context.Context, req provider.ConfigureRequest) (*ProviderCo
 		User                      types.String `tfsdk:"user"`
 		Password                  types.String `tfsdk:"password"`
 		ValidateServerCertificate types.Bool   `tfsdk:"validate_server_certificate"`
+		ConnectTimeout            types.Int64  `tfsdk:"connect_timeout"`
 	}
 	diags.Append(req.Config.Get(ctx, &cfg)...)
 
@@ -34,12 +36,16 @@ func LoadConfig(ctx context.Context, req provider.ConfigureRequest) (*ProviderCo
 		User:                      cfg.User.ValueString(),
 		Password:                  cfg.Password.ValueString(),
 		ValidateServerCertificate: true,
+		ConnectTimeout:            60,
 	}
 	if !cfg.Port.IsNull() {
 		out.Port = cfg.Port.ValueInt64()
 	}
 	if !cfg.ValidateServerCertificate.IsNull() {
 		out.ValidateServerCertificate = cfg.ValidateServerCertificate.ValueBool()
+	}
+	if !cfg.ConnectTimeout.IsNull() {
+		out.ConnectTimeout = cfg.ConnectTimeout.ValueInt64()
 	}
 
 	return out, diags

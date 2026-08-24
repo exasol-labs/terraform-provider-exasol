@@ -44,9 +44,23 @@ func NewClient(ctx context.Context, c *ProviderConfig) (*Client, error) {
 	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	if err := db.PingContext(ctx); err != nil {
-		return nil, err
+	// Retry the initial ping until connect_timeout elapses: each ping dials a
+	// fresh connection, so this rides out IP-allowlist propagation delays.
+	deadline := time.Now().Add(time.Duration(c.ConnectTimeout) * time.Second)
+	for {
+		err = db.PingContext(ctx)
+		if err == nil {
+			return &Client{DB: db}, nil
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			_ = db.Close()
+			return nil, ctx.Err()
+		case <-time.After(10 * time.Second):
+		}
 	}
-
-	return &Client{DB: db}, nil
 }

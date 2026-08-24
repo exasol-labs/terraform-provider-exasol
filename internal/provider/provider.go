@@ -57,6 +57,10 @@ func (p *ExasolProvider) Schema(
 				Optional:    true,
 				Description: "Validate server TLS certificate. Default true.",
 			},
+			"connect_timeout": schema.Int64Attribute{
+				Optional:    true,
+				Description: "Total time in seconds to keep retrying the initial connection before failing. Useful when an IP allowlist entry needs time to propagate. Default 60.",
+			},
 		},
 	}
 }
