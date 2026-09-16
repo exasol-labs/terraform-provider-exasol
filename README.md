@@ -44,6 +44,8 @@ The provider also accepts Exasol Personal Access Tokens (PAT) in the `password` 
 | [`exasol_system_privilege`](docs/resources/system_privilege.md) | System-level privileges (CREATE SESSION, etc.) |
 | [`exasol_object_privilege`](docs/resources/object_privilege.md) | Object-level privileges (SELECT, INSERT, etc.) |
 | [`exasol_role_grant`](docs/resources/role_grant.md) | Role-to-user or role-to-role grants |
+| [`exasol_user_impersonation_grant`](docs/resources/user_impersonation_grant.md) | Scoped impersonation of individual users |
+| [`exasol_role_impersonation_grant`](docs/resources/role_impersonation_grant.md) | Scoped impersonation of individual roles |
 | [`exasol_connection_grant`](docs/resources/connection_grant.md) | Connection access grants |
 
 All resources support in-place rename and `terraform import`. See individual resource docs for usage examples and import syntax.

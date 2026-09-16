@@ -85,11 +85,13 @@ func (p *ExasolProvider) Resources(_ context.Context) []func() resource.Resource
 	return []func() resource.Resource{
 		resources.NewConnectionResource,
 		resources.NewConnectionGrantResource,
+		resources.NewRoleImpersonationGrantResource,
 		resources.NewObjectPrivilegeResource,
 		resources.NewRoleGrantResource,
 		resources.NewRoleResource,
 		resources.NewSchemaResource,
 		resources.NewSystemPrivilegeResource,
+		resources.NewUserImpersonationGrantResource,
 		resources.NewUserResource,
 	}
 }
