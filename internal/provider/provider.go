@@ -85,6 +85,7 @@ func (p *ExasolProvider) Resources(_ context.Context) []func() resource.Resource
 	return []func() resource.Resource{
 		resources.NewConnectionResource,
 		resources.NewConnectionGrantResource,
+		resources.NewImpersonationGrantResource,
 		resources.NewObjectPrivilegeResource,
 		resources.NewRoleGrantResource,
 		resources.NewRoleResource,

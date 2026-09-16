@@ -221,6 +221,28 @@ func testAccCheckObjectPrivilegeDestroy(s *terraform.State) error {
 	return nil
 }
 
+func testAccCheckImpersonationGrantDestroy(s *terraform.State) error {
+	db := mustOpenDB()
+	defer db.Close()
+	for _, rs := range s.RootModule().Resources {
+		if rs.Type != "exasol_impersonation_grant" {
+			continue
+		}
+		parts := strings.SplitN(rs.Primary.ID, "|", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_IMPERSONATION_PRIVS WHERE GRANTEE = ? AND IMPERSONATION_ON = ?`, parts[0], parts[1]).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return fmt.Errorf("impersonation grant %s still exists after destroy", rs.Primary.ID)
+		}
+	}
+	return nil
+}
+
 func testAccCheckConnectionGrantDestroy(s *terraform.State) error {
 	db := mustOpenDB()
 	defer db.Close()
@@ -245,9 +267,14 @@ func testAccCheckConnectionGrantDestroy(s *terraform.State) error {
 }
 
 func mustOpenDB() *sql.DB {
+	return openDBAs(
+		envOrDefault("EXASOL_USER", "sys"),
+		envOrDefault("EXASOL_PASSWORD", "exasol"),
+	)
+}
+
+func openDBAs(user, password string) *sql.DB {
 	host := envOrDefault("EXASOL_HOST", "localhost")
-	user := envOrDefault("EXASOL_USER", "sys")
-	password := envOrDefault("EXASOL_PASSWORD", "exasol")
 
 	dsn := exasol.NewConfig(user, password).
 		Host(host).
@@ -260,6 +287,36 @@ func mustOpenDB() *sql.DB {
 		panic(fmt.Sprintf("CheckDestroy: failed to open database: %v", err))
 	}
 	return db
+}
+
+func testAccCheckImpersonationEnforcement(_ *terraform.State) error {
+	allowedDB := openDBAs("ACC_IMPERSONATION_LOGIN", "login-password")
+	defer allowedDB.Close()
+	if _, err := allowedDB.Exec(`IMPERSONATE ACC_IMPERSONATION_ALLOWED`); err != nil {
+		return fmt.Errorf("allowed impersonation failed: %w", err)
+	}
+
+	deniedDB := openDBAs("ACC_IMPERSONATION_LOGIN", "login-password")
+	defer deniedDB.Close()
+	if _, err := deniedDB.Exec(`IMPERSONATE ACC_IMPERSONATION_DENIED`); err == nil {
+		return fmt.Errorf("unlisted user can be impersonated")
+	}
+	return nil
+}
+
+func testAccCheckImpersonationEnforcementAfterUpdate(_ *terraform.State) error {
+	allowedDB := openDBAs("ACC_IMPERSONATION_LOGIN", "login-password")
+	defer allowedDB.Close()
+	if _, err := allowedDB.Exec(`IMPERSONATE ACC_IMPERSONATION_DENIED`); err != nil {
+		return fmt.Errorf("updated impersonation failed: %w", err)
+	}
+
+	deniedDB := openDBAs("ACC_IMPERSONATION_LOGIN", "login-password")
+	defer deniedDB.Close()
+	if _, err := deniedDB.Exec(`IMPERSONATE ACC_IMPERSONATION_ALLOWED`); err == nil {
+		return fmt.Errorf("replaced impersonation grant was not revoked")
+	}
+	return nil
 }
 
 // --- Role: create, rename (update in-place), import ---
@@ -660,9 +717,11 @@ func TestAccObjectPrivilege_OnSchema(t *testing.T) {
 resource "exasol_schema" "test" {
   name = "ACC_OBJPRIV_SCHEMA"
 }
+
 resource "exasol_role" "test" {
   name = "ACC_OBJPRIV_ROLE"
 }
+
 resource "exasol_object_privilege" "test" {
   grantee     = exasol_role.test.name
   privileges  = ["SELECT"]
@@ -697,6 +756,94 @@ resource "exasol_object_privilege" "test" {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("exasol_object_privilege.test", "privileges.#", "2"),
 				),
+			},
+		},
+	})
+}
+
+func TestAccImpersonationGrant(t *testing.T) {
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckImpersonationGrantDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: providerConfig() + `
+resource "exasol_user" "allowed" {
+  name      = "ACC_IMPERSONATION_ALLOWED"
+  auth_type = "PASSWORD"
+  password  = "allowed-password"
+}
+resource "exasol_user" "denied" {
+  name      = "ACC_IMPERSONATION_DENIED"
+  auth_type = "PASSWORD"
+  password  = "denied-password"
+}
+resource "exasol_role" "grantee" {
+  name = "ACC_IMPERSONATION_GRANTEE"
+}
+resource "exasol_user" "login" {
+  name      = "ACC_IMPERSONATION_LOGIN"
+  auth_type = "PASSWORD"
+  password  = "login-password"
+}
+resource "exasol_role_grant" "grantee_to_login" {
+  role    = exasol_role.grantee.name
+  grantee = exasol_user.login.name
+}
+resource "exasol_impersonation_grant" "allowed" {
+  grantee           = exasol_role.grantee.name
+  impersonated_user = exasol_user.allowed.name
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckFunc(testAccCheckImpersonationEnforcement),
+					resource.TestCheckResourceAttr("exasol_impersonation_grant.allowed", "grantee", "ACC_IMPERSONATION_GRANTEE"),
+					resource.TestCheckResourceAttr("exasol_impersonation_grant.allowed", "impersonated_user", "ACC_IMPERSONATION_ALLOWED"),
+					resource.TestCheckResourceAttr("exasol_impersonation_grant.allowed", "id", "ACC_IMPERSONATION_GRANTEE|ACC_IMPERSONATION_ALLOWED"),
+				),
+			},
+			{
+				Config: providerConfig() + `
+resource "exasol_user" "allowed" {
+  name      = "ACC_IMPERSONATION_ALLOWED"
+  auth_type = "PASSWORD"
+  password  = "allowed-password"
+}
+resource "exasol_user" "denied" {
+  name      = "ACC_IMPERSONATION_DENIED"
+  auth_type = "PASSWORD"
+  password  = "denied-password"
+}
+resource "exasol_role" "grantee" {
+  name = "ACC_IMPERSONATION_GRANTEE"
+}
+resource "exasol_user" "login" {
+  name      = "ACC_IMPERSONATION_LOGIN"
+  auth_type = "PASSWORD"
+  password  = "login-password"
+}
+resource "exasol_role_grant" "grantee_to_login" {
+  role    = exasol_role.grantee.name
+  grantee = exasol_user.login.name
+}
+resource "exasol_impersonation_grant" "allowed" {
+  grantee           = exasol_role.grantee.name
+  impersonated_user = exasol_user.denied.name
+}
+`,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("exasol_impersonation_grant.allowed", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.TestCheckFunc(testAccCheckImpersonationEnforcementAfterUpdate),
+			},
+			{
+				ResourceName:      "exasol_impersonation_grant.allowed",
+				ImportState:       true,
+				ImportStateVerify: true,
+				ImportStateId:     "ACC_IMPERSONATION_GRANTEE|ACC_IMPERSONATION_DENIED",
 			},
 		},
 	})

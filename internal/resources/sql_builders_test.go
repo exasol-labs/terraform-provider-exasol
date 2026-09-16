@@ -280,3 +280,30 @@ func TestRoleGrantID(t *testing.T) {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
+
+func TestImpersonationGrantSQL(t *testing.T) {
+	grant, revoke := impersonationGrantSQL("mcp_role", "alice@example.com")
+	if grant != `GRANT IMPERSONATION ON "ALICE@EXAMPLE.COM" TO "MCP_ROLE"` {
+		t.Fatalf("grant SQL = %q", grant)
+	}
+	if revoke != `REVOKE IMPERSONATION ON "ALICE@EXAMPLE.COM" FROM "MCP_ROLE"` {
+		t.Fatalf("revoke SQL = %q", revoke)
+	}
+}
+
+func TestImpersonationGrantSQL_EscapesIdentifiers(t *testing.T) {
+	grant, revoke := impersonationGrantSQL(`mcp"role`, `alice"user`)
+	if grant != `GRANT IMPERSONATION ON "ALICE""USER" TO "MCP""ROLE"` {
+		t.Fatalf("grant SQL = %q", grant)
+	}
+	if revoke != `REVOKE IMPERSONATION ON "ALICE""USER" FROM "MCP""ROLE"` {
+		t.Fatalf("revoke SQL = %q", revoke)
+	}
+}
+
+func TestImpersonationGrantID(t *testing.T) {
+	got := impersonationGrantID("mcp_role", "alice@example.com")
+	if got != "MCP_ROLE|ALICE@EXAMPLE.COM" {
+		t.Fatalf("ID = %q", got)
+	}
+}

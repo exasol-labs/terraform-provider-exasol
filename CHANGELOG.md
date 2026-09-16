@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.2.4] - 2026-09-16
 
+### Added
+- Scoped `exasol_impersonation_grant` resource for granting impersonation of individual users
+
 ### Security
 - Update `google.golang.org/grpc` from 1.82.1 to 1.83.1, including fixes for xDS RBAC authorization bypasses and HTTP/2 resource-exhaustion handling
 
