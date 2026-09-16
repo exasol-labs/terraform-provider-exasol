@@ -4,10 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.2.4] - 2026-09-16
+## [0.2.5] - 2026-09-16
 
 ### Added
-- Scoped `exasol_impersonation_grant` resource for granting impersonation of individual users
+- Scoped `exasol_user_impersonation_grant` and `exasol_role_impersonation_grant` resources for granting impersonation of individual users and roles
+
+### Security
+- Update `google.golang.org/grpc` from 1.83.1 to 1.83.2 for GHSA-2v4p-qf9q-27wj, plus refreshed indirect dependencies
+
+## [0.2.4] - 2026-09-16
 
 ### Security
 - Update `google.golang.org/grpc` from 1.82.1 to 1.83.1, including fixes for xDS RBAC authorization bypasses and HTTP/2 resource-exhaustion handling

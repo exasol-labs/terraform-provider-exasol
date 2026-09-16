@@ -18,53 +18,63 @@ import (
 var _ resource.Resource = &ImpersonationGrantResource{}
 var _ resource.ResourceWithImportState = &ImpersonationGrantResource{}
 
-// ImpersonationGrantResource manages a scoped impersonation grant from a user
-// or role to one database user.
+type impersonationTargetKind string
+
+const (
+	impersonationUserTarget impersonationTargetKind = "USER"
+	impersonationRoleTarget impersonationTargetKind = "ROLE"
+)
+
+// ImpersonationGrantResource manages a scoped impersonation grant for either
+// one database user or one database role.
 type ImpersonationGrantResource struct {
-	db *sql.DB
+	db         *sql.DB
+	targetKind impersonationTargetKind
 }
 
-func NewImpersonationGrantResource() resource.Resource {
-	return &ImpersonationGrantResource{}
+func NewUserImpersonationGrantResource() resource.Resource {
+	return &ImpersonationGrantResource{targetKind: impersonationUserTarget}
+}
+
+func NewRoleImpersonationGrantResource() resource.Resource {
+	return &ImpersonationGrantResource{targetKind: impersonationRoleTarget}
 }
 
 func (r *ImpersonationGrantResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
-	resp.TypeName = req.ProviderTypeName + "_impersonation_grant"
+	resp.TypeName = req.ProviderTypeName + "_" + r.resourceSuffix()
 }
 
 func (r *ImpersonationGrantResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
+	targetLabel := strings.ToLower(string(r.targetKind))
 	resp.Schema = schema.Schema{
-		Description: "Grants a user or role permission to impersonate one regular database user.",
+		Description: fmt.Sprintf("Grants a user or role permission to impersonate one database %s.", targetLabel),
 		Attributes: map[string]schema.Attribute{
 			"grantee": schema.StringAttribute{
 				Required:    true,
 				Description: "User or role receiving the impersonation permission.",
 			},
-			"impersonated_user": schema.StringAttribute{
+			"target": schema.StringAttribute{
 				Required:    true,
-				Description: "Regular database user whose identity may be impersonated. Roles are not accepted.",
+				Description: r.targetDescription(targetLabel),
 			},
 			"id": schema.StringAttribute{
 				Computed:    true,
-				Description: "Terraform ID in format: GRANTEE|IMPERSONATED_USER",
+				Description: "Terraform ID in format: GRANTEE|TARGET",
 			},
 		},
 	}
 }
 
 func (r *ImpersonationGrantResource) Configure(_ context.Context, req resource.ConfigureRequest, _ *resource.ConfigureResponse) {
-	if req.ProviderData == nil {
-		return
-	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
 	}
 }
 
 type impersonationGrantModel struct {
-	ID               types.String `tfsdk:"id"`
-	Grantee          types.String `tfsdk:"grantee"`
-	ImpersonatedUser types.String `tfsdk:"impersonated_user"`
+	ID      types.String `tfsdk:"id"`
+	Grantee types.String `tfsdk:"grantee"`
+	Target  types.String `tfsdk:"target"`
 }
 
 func (r *ImpersonationGrantResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -78,40 +88,27 @@ func (r *ImpersonationGrantResource) Create(ctx context.Context, req resource.Cr
 		return
 	}
 
-	grantee := normalizeImpersonationName(plan.Grantee.ValueString())
-	impersonatedUser := normalizeImpersonationName(plan.ImpersonatedUser.ValueString())
-	if !isValidIdentifier(grantee) {
-		resp.Diagnostics.AddError("Invalid grantee", "Grantee name must not be empty.")
-		return
-	}
-	if !isValidIdentifier(impersonatedUser) {
-		resp.Diagnostics.AddError("Invalid impersonated user", "Impersonated user name must not be empty.")
-		return
-	}
-	if err := r.validateUser(ctx, impersonatedUser); err != nil {
-		resp.Diagnostics.AddError("Invalid impersonated user", err.Error())
+	grantee, target := r.names(plan.Grantee.ValueString(), plan.Target.ValueString())
+	if err := r.validateTarget(ctx, grantee, target); err != nil {
+		resp.Diagnostics.AddError("Invalid impersonation grant", err.Error())
 		return
 	}
 
-	exists, err := r.impersonationGrantExists(ctx, grantee, impersonatedUser)
+	exists, err := r.grantExists(ctx, grantee, target)
 	if err != nil {
 		resp.Diagnostics.AddError("Check impersonation grant failed", err.Error())
 		return
 	}
-	if exists {
-		plan.ID = types.StringValue(impersonationGrantID(grantee, impersonatedUser))
-		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
-		return
+	if !exists {
+		grant, _ := impersonationGrantSQL(grantee, target)
+		tflog.Info(ctx, "Granting impersonation", map[string]any{"sql": grant})
+		if _, err := r.db.ExecContext(ctx, grant); err != nil {
+			resp.Diagnostics.AddError("GRANT IMPERSONATION failed", err.Error())
+			return
+		}
 	}
 
-	grant, _ := impersonationGrantSQL(grantee, impersonatedUser)
-	tflog.Info(ctx, "Granting impersonation", map[string]any{"sql": grant})
-	if _, err := r.db.ExecContext(ctx, grant); err != nil {
-		resp.Diagnostics.AddError("GRANT IMPERSONATION failed", err.Error())
-		return
-	}
-
-	plan.ID = types.StringValue(impersonationGrantID(grantee, impersonatedUser))
+	plan.ID = types.StringValue(impersonationGrantID(grantee, target))
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -120,16 +117,14 @@ func (r *ImpersonationGrantResource) Read(ctx context.Context, req resource.Read
 		resp.Diagnostics.AddError("Database not configured", "Provider did not supply a database connection.")
 		return
 	}
-
 	var state impersonationGrantModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	grantee := normalizeImpersonationName(state.Grantee.ValueString())
-	impersonatedUser := normalizeImpersonationName(state.ImpersonatedUser.ValueString())
-	exists, err := r.impersonationGrantExists(ctx, grantee, impersonatedUser)
+	grantee, target := r.names(state.Grantee.ValueString(), state.Target.ValueString())
+	exists, err := r.grantExists(ctx, grantee, target)
 	if err != nil {
 		resp.Diagnostics.AddError("Read impersonation grant failed", err.Error())
 		return
@@ -139,7 +134,7 @@ func (r *ImpersonationGrantResource) Read(ctx context.Context, req resource.Read
 		return
 	}
 
-	state.ID = types.StringValue(impersonationGrantID(grantee, impersonatedUser))
+	state.ID = types.StringValue(impersonationGrantID(grantee, target))
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -155,42 +150,35 @@ func (r *ImpersonationGrantResource) Update(ctx context.Context, req resource.Up
 		return
 	}
 
-	oldGrantee := normalizeImpersonationName(state.Grantee.ValueString())
-	oldUser := normalizeImpersonationName(state.ImpersonatedUser.ValueString())
-	newGrantee := normalizeImpersonationName(plan.Grantee.ValueString())
-	newUser := normalizeImpersonationName(plan.ImpersonatedUser.ValueString())
-	if oldGrantee == newGrantee && oldUser == newUser {
-		plan.ID = types.StringValue(impersonationGrantID(newGrantee, newUser))
+	oldGrantee, oldTarget := r.names(state.Grantee.ValueString(), state.Target.ValueString())
+	newGrantee, newTarget := r.names(plan.Grantee.ValueString(), plan.Target.ValueString())
+	if oldGrantee == newGrantee && oldTarget == newTarget {
+		plan.ID = types.StringValue(impersonationGrantID(newGrantee, newTarget))
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
 	}
-	if !isValidIdentifier(newGrantee) || !isValidIdentifier(newUser) {
-		resp.Diagnostics.AddError("Invalid impersonation grant", "Grantee and impersonated user names must not be empty.")
-		return
-	}
-	if err := r.validateUser(ctx, newUser); err != nil {
-		resp.Diagnostics.AddError("Invalid impersonated user", err.Error())
+	if err := r.validateTarget(ctx, newGrantee, newTarget); err != nil {
+		resp.Diagnostics.AddError("Invalid impersonation grant", err.Error())
 		return
 	}
 
-	newExists, err := r.impersonationGrantExists(ctx, newGrantee, newUser)
+	newExists, err := r.grantExists(ctx, newGrantee, newTarget)
 	if err != nil {
 		resp.Diagnostics.AddError("Check new impersonation grant failed", err.Error())
 		return
 	}
-
-	_, revoke := impersonationGrantSQL(oldGrantee, oldUser)
+	_, revoke := impersonationGrantSQL(oldGrantee, oldTarget)
 	tflog.Info(ctx, "Revoking old impersonation", map[string]any{"sql": revoke})
 	if _, err := r.db.ExecContext(ctx, revoke); err != nil {
 		resp.Diagnostics.AddError("REVOKE IMPERSONATION failed", err.Error())
 		return
 	}
-
 	if !newExists {
-		grant, _ := impersonationGrantSQL(newGrantee, newUser)
+		grant, _ := impersonationGrantSQL(newGrantee, newTarget)
 		tflog.Info(ctx, "Granting new impersonation", map[string]any{"sql": grant})
 		if _, err := r.db.ExecContext(ctx, grant); err != nil {
-			oldGrant, _ := impersonationGrantSQL(oldGrantee, oldUser)
+			oldGrant, _ := impersonationGrantSQL(oldGrantee, oldTarget)
+			tflog.Warn(ctx, "Restoring old impersonation after failed update", map[string]any{"sql": oldGrant})
 			if _, rollbackErr := r.db.ExecContext(ctx, oldGrant); rollbackErr != nil {
 				resp.Diagnostics.AddError("GRANT IMPERSONATION failed and rollback failed", fmt.Sprintf("grant error: %v; rollback error: %v", err, rollbackErr))
 				return
@@ -200,7 +188,7 @@ func (r *ImpersonationGrantResource) Update(ctx context.Context, req resource.Up
 		}
 	}
 
-	plan.ID = types.StringValue(impersonationGrantID(newGrantee, newUser))
+	plan.ID = types.StringValue(impersonationGrantID(newGrantee, newTarget))
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -218,9 +206,8 @@ func (r *ImpersonationGrantResource) Delete(ctx context.Context, req resource.De
 		return
 	}
 
-	grantee := normalizeImpersonationName(state.Grantee.ValueString())
-	impersonatedUser := normalizeImpersonationName(state.ImpersonatedUser.ValueString())
-	exists, err := r.impersonationGrantExists(ctx, grantee, impersonatedUser)
+	grantee, target := r.names(state.Grantee.ValueString(), state.Target.ValueString())
+	exists, err := r.grantExists(ctx, grantee, target)
 	if err != nil {
 		resp.Diagnostics.AddError("Check impersonation grant failed", err.Error())
 		return
@@ -228,8 +215,7 @@ func (r *ImpersonationGrantResource) Delete(ctx context.Context, req resource.De
 	if !exists {
 		return
 	}
-
-	_, revoke := impersonationGrantSQL(grantee, impersonatedUser)
+	_, revoke := impersonationGrantSQL(grantee, target)
 	tflog.Info(ctx, "Revoking impersonation", map[string]any{"sql": revoke})
 	if _, err := r.db.ExecContext(ctx, revoke); err != nil {
 		resp.Diagnostics.AddError("REVOKE IMPERSONATION failed", err.Error())
@@ -239,53 +225,88 @@ func (r *ImpersonationGrantResource) Delete(ctx context.Context, req resource.De
 func (r *ImpersonationGrantResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	parts := strings.Split(req.ID, "|")
 	if len(parts) != 2 || !isValidIdentifier(parts[0]) || !isValidIdentifier(parts[1]) {
-		resp.Diagnostics.AddError("Invalid import ID", `Expected format: "GRANTEE|IMPERSONATED_USER"`)
+		resp.Diagnostics.AddError("Invalid import ID", `Expected format: "GRANTEE|TARGET"`)
 		return
 	}
 	resp.State.SetAttribute(ctx, path.Root("grantee"), normalizeImpersonationName(parts[0]))
-	resp.State.SetAttribute(ctx, path.Root("impersonated_user"), normalizeImpersonationName(parts[1]))
+	resp.State.SetAttribute(ctx, path.Root("target"), normalizeImpersonationName(parts[1]))
 	resp.State.SetAttribute(ctx, path.Root("id"), impersonationGrantID(parts[0], parts[1]))
 }
 
-func (r *ImpersonationGrantResource) validateUser(ctx context.Context, user string) error {
-	if strings.EqualFold(user, "SYS") {
+func (r *ImpersonationGrantResource) validateTarget(ctx context.Context, grantee, target string) error {
+	if !isValidIdentifier(grantee) || !isValidIdentifier(target) {
+		return fmt.Errorf("grantee and target names must not be empty")
+	}
+	if r.targetKind == impersonationUserTarget && strings.EqualFold(target, "SYS") {
 		return fmt.Errorf("impersonating SYS is not allowed")
 	}
+	if r.targetKind == impersonationRoleTarget && isProtectedImpersonationRole(target) {
+		return fmt.Errorf("impersonating the %s role is not allowed", strings.ToUpper(target))
+	}
 
+	table := "EXA_DBA_ROLES"
+	column := "ROLE_NAME"
+	if r.targetKind == impersonationUserTarget {
+		table = "EXA_DBA_USERS"
+		column = "USER_NAME"
+	}
 	var found int
-	err := r.db.QueryRowContext(ctx, `SELECT 1 FROM EXA_DBA_USERS WHERE USER_NAME = ?`, user).Scan(&found)
+	err := r.db.QueryRowContext(ctx, fmt.Sprintf("SELECT 1 FROM %s WHERE %s = ?", table, column), target).Scan(&found)
 	if err == sql.ErrNoRows {
-		return fmt.Errorf("user %q does not exist", user)
+		return fmt.Errorf("%s %q does not exist", strings.ToLower(string(r.targetKind)), target)
 	}
 	return err
 }
 
-func (r *ImpersonationGrantResource) impersonationGrantExists(ctx context.Context, grantee, impersonatedUser string) (bool, error) {
+func (r *ImpersonationGrantResource) names(grantee, target string) (string, string) {
+	return normalizeImpersonationName(grantee), normalizeImpersonationName(target)
+}
+
+func (r *ImpersonationGrantResource) resourceSuffix() string {
+	if r.targetKind == impersonationRoleTarget {
+		return "role_impersonation_grant"
+	}
+	return "user_impersonation_grant"
+}
+
+func (r *ImpersonationGrantResource) targetDescription(targetLabel string) string {
+	if r.targetKind == impersonationRoleTarget {
+		return "Role whose members may be impersonated. Every user holding this role becomes impersonable."
+	}
+	return fmt.Sprintf("Database %s whose identity may be impersonated.", targetLabel)
+}
+
+func (r *ImpersonationGrantResource) grantExists(ctx context.Context, grantee, target string) (bool, error) {
 	var found int
 	err := r.db.QueryRowContext(ctx,
 		`SELECT 1 FROM EXA_DBA_IMPERSONATION_PRIVS WHERE GRANTEE = ? AND IMPERSONATION_ON = ?`,
-		grantee, impersonatedUser).Scan(&found)
+		grantee, target).Scan(&found)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	return err == nil, err
 }
 
 func normalizeImpersonationName(name string) string {
 	return strings.ToUpper(name)
 }
 
-func impersonationGrantSQL(grantee, impersonatedUser string) (string, string) {
-	escapedGrantee := escapeIdentifierLiteral(normalizeImpersonationName(grantee))
-	escapedUser := escapeIdentifierLiteral(normalizeImpersonationName(impersonatedUser))
-	grant := fmt.Sprintf(`GRANT IMPERSONATION ON "%s" TO "%s"`, escapedUser, escapedGrantee)
-	revoke := fmt.Sprintf(`REVOKE IMPERSONATION ON "%s" FROM "%s"`, escapedUser, escapedGrantee)
-	return grant, revoke
+func isProtectedImpersonationRole(role string) bool {
+	switch normalizeImpersonationName(role) {
+	case "PUBLIC", "DBA":
+		return true
+	default:
+		return false
+	}
 }
 
-func impersonationGrantID(grantee, impersonatedUser string) string {
-	return fmt.Sprintf("%s|%s", normalizeImpersonationName(grantee), normalizeImpersonationName(impersonatedUser))
+func impersonationGrantSQL(grantee, target string) (string, string) {
+	escapedGrantee := escapeIdentifierLiteral(normalizeImpersonationName(grantee))
+	escapedTarget := escapeIdentifierLiteral(normalizeImpersonationName(target))
+	return fmt.Sprintf(`GRANT IMPERSONATION ON "%s" TO "%s"`, escapedTarget, escapedGrantee),
+		fmt.Sprintf(`REVOKE IMPERSONATION ON "%s" FROM "%s"`, escapedTarget, escapedGrantee)
+}
+
+func impersonationGrantID(grantee, target string) string {
+	return fmt.Sprintf("%s|%s", normalizeImpersonationName(grantee), normalizeImpersonationName(target))
 }

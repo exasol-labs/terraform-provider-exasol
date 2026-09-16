@@ -307,3 +307,14 @@ func TestImpersonationGrantID(t *testing.T) {
 		t.Fatalf("ID = %q", got)
 	}
 }
+
+func TestProtectedImpersonationRoles(t *testing.T) {
+	for _, role := range []string{"PUBLIC", "public", "DBA", "dba"} {
+		if !isProtectedImpersonationRole(role) {
+			t.Errorf("isProtectedImpersonationRole(%q) = false, want true", role)
+		}
+	}
+	if isProtectedImpersonationRole("REPORTING_ROLE") {
+		t.Error("ordinary role was treated as protected")
+	}
+}

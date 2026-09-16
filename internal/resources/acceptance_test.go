@@ -225,7 +225,7 @@ func testAccCheckImpersonationGrantDestroy(s *terraform.State) error {
 	db := mustOpenDB()
 	defer db.Close()
 	for _, rs := range s.RootModule().Resources {
-		if rs.Type != "exasol_impersonation_grant" {
+		if rs.Type != "exasol_user_impersonation_grant" && rs.Type != "exasol_role_impersonation_grant" {
 			continue
 		}
 		parts := strings.SplitN(rs.Primary.ID, "|", 2)
@@ -295,12 +295,6 @@ func testAccCheckImpersonationEnforcement(_ *terraform.State) error {
 	if _, err := allowedDB.Exec(`IMPERSONATE ACC_IMPERSONATION_ALLOWED`); err != nil {
 		return fmt.Errorf("allowed impersonation failed: %w", err)
 	}
-
-	deniedDB := openDBAs("ACC_IMPERSONATION_LOGIN", "login-password")
-	defer deniedDB.Close()
-	if _, err := deniedDB.Exec(`IMPERSONATE ACC_IMPERSONATION_DENIED`); err == nil {
-		return fmt.Errorf("unlisted user can be impersonated")
-	}
 	return nil
 }
 
@@ -315,6 +309,15 @@ func testAccCheckImpersonationEnforcementAfterUpdate(_ *terraform.State) error {
 	defer deniedDB.Close()
 	if _, err := deniedDB.Exec(`IMPERSONATE ACC_IMPERSONATION_ALLOWED`); err == nil {
 		return fmt.Errorf("replaced impersonation grant was not revoked")
+	}
+	return nil
+}
+
+func testAccCheckRoleImpersonationEnforcement(_ *terraform.State) error {
+	db := openDBAs("ACC_IMPERSONATION_LOGIN", "login-password")
+	defer db.Close()
+	if _, err := db.Exec(`IMPERSONATE ACC_IMPERSONATION_DENIED`); err != nil {
+		return fmt.Errorf("role-based impersonation failed: %w", err)
 	}
 	return nil
 }
@@ -782,6 +785,13 @@ resource "exasol_user" "denied" {
 resource "exasol_role" "grantee" {
   name = "ACC_IMPERSONATION_GRANTEE"
 }
+resource "exasol_role" "target" {
+  name = "ACC_IMPERSONATION_TARGET_ROLE"
+}
+resource "exasol_role_grant" "target_to_denied" {
+  role    = exasol_role.target.name
+  grantee = exasol_user.denied.name
+}
 resource "exasol_user" "login" {
   name      = "ACC_IMPERSONATION_LOGIN"
   auth_type = "PASSWORD"
@@ -791,16 +801,23 @@ resource "exasol_role_grant" "grantee_to_login" {
   role    = exasol_role.grantee.name
   grantee = exasol_user.login.name
 }
-resource "exasol_impersonation_grant" "allowed" {
+resource "exasol_user_impersonation_grant" "allowed" {
   grantee           = exasol_role.grantee.name
-  impersonated_user = exasol_user.allowed.name
+  target            = exasol_user.allowed.name
+}
+resource "exasol_role_impersonation_grant" "target" {
+  grantee = exasol_role.grantee.name
+  target  = exasol_role.target.name
 }
 `,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckFunc(testAccCheckImpersonationEnforcement),
-					resource.TestCheckResourceAttr("exasol_impersonation_grant.allowed", "grantee", "ACC_IMPERSONATION_GRANTEE"),
-					resource.TestCheckResourceAttr("exasol_impersonation_grant.allowed", "impersonated_user", "ACC_IMPERSONATION_ALLOWED"),
-					resource.TestCheckResourceAttr("exasol_impersonation_grant.allowed", "id", "ACC_IMPERSONATION_GRANTEE|ACC_IMPERSONATION_ALLOWED"),
+					resource.TestCheckFunc(testAccCheckRoleImpersonationEnforcement),
+					resource.TestCheckResourceAttr("exasol_user_impersonation_grant.allowed", "grantee", "ACC_IMPERSONATION_GRANTEE"),
+					resource.TestCheckResourceAttr("exasol_user_impersonation_grant.allowed", "target", "ACC_IMPERSONATION_ALLOWED"),
+					resource.TestCheckResourceAttr("exasol_user_impersonation_grant.allowed", "id", "ACC_IMPERSONATION_GRANTEE|ACC_IMPERSONATION_ALLOWED"),
+					resource.TestCheckResourceAttr("exasol_role_impersonation_grant.target", "target", "ACC_IMPERSONATION_TARGET_ROLE"),
+					resource.TestCheckResourceAttr("exasol_role_impersonation_grant.target", "id", "ACC_IMPERSONATION_GRANTEE|ACC_IMPERSONATION_TARGET_ROLE"),
 				),
 			},
 			{
@@ -818,6 +835,13 @@ resource "exasol_user" "denied" {
 resource "exasol_role" "grantee" {
   name = "ACC_IMPERSONATION_GRANTEE"
 }
+resource "exasol_role" "target" {
+  name = "ACC_IMPERSONATION_TARGET_ROLE"
+}
+resource "exasol_role_grant" "target_to_denied" {
+  role    = exasol_role.target.name
+  grantee = exasol_user.denied.name
+}
 resource "exasol_user" "login" {
   name      = "ACC_IMPERSONATION_LOGIN"
   auth_type = "PASSWORD"
@@ -827,23 +851,33 @@ resource "exasol_role_grant" "grantee_to_login" {
   role    = exasol_role.grantee.name
   grantee = exasol_user.login.name
 }
-resource "exasol_impersonation_grant" "allowed" {
+resource "exasol_user_impersonation_grant" "allowed" {
   grantee           = exasol_role.grantee.name
-  impersonated_user = exasol_user.denied.name
+  target            = exasol_user.denied.name
+}
+resource "exasol_role_impersonation_grant" "target" {
+  grantee = exasol_role.grantee.name
+  target  = exasol_role.target.name
 }
 `,
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{
-						plancheck.ExpectResourceAction("exasol_impersonation_grant.allowed", plancheck.ResourceActionUpdate),
+						plancheck.ExpectResourceAction("exasol_user_impersonation_grant.allowed", plancheck.ResourceActionUpdate),
 					},
 				},
 				Check: resource.TestCheckFunc(testAccCheckImpersonationEnforcementAfterUpdate),
 			},
 			{
-				ResourceName:      "exasol_impersonation_grant.allowed",
+				ResourceName:      "exasol_user_impersonation_grant.allowed",
 				ImportState:       true,
 				ImportStateVerify: true,
 				ImportStateId:     "ACC_IMPERSONATION_GRANTEE|ACC_IMPERSONATION_DENIED",
+			},
+			{
+				ResourceName:      "exasol_role_impersonation_grant.target",
+				ImportState:       true,
+				ImportStateVerify: true,
+				ImportStateId:     "ACC_IMPERSONATION_GRANTEE|ACC_IMPERSONATION_TARGET_ROLE",
 			},
 		},
 	})
