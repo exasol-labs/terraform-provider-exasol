@@ -542,6 +542,116 @@ resource "exasol_user_impersonation_grant" "as_target" {
 	})
 }
 
+// Renaming a role, schema and connection must keep every grant that
+// references them, as grantee, granted role, object or impersonation target.
+func TestAccRename_RoleSchemaConnection(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(suffix string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_role" "r" {
+  name = "ACC_REN_ROLE_%[1]s"
+}
+resource "exasol_role" "inner" {
+  name = "ACC_REN_INNER_%[1]s"
+}
+resource "exasol_user" "u" {
+  name      = "ACC_REN_USER"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_user" "other" {
+  name      = "ACC_REN_OTHER"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_schema" "s" {
+  name = "ACC_REN_SCHEMA_%[1]s"
+}
+resource "exasol_connection" "c" {
+  name = "ACC_REN_CONN_%[1]s"
+  to   = "localhost:8563"
+}
+resource "exasol_role_grant" "r_to_user" {
+  role    = exasol_role.r.name
+  grantee = exasol_user.u.name
+}
+resource "exasol_role_grant" "inner_to_r" {
+  role              = exasol_role.inner.name
+  grantee           = exasol_role.r.name
+  with_admin_option = true
+}
+resource "exasol_system_privilege" "r_create_table" {
+  grantee   = exasol_role.r.name
+  privilege = "CREATE TABLE"
+}
+resource "exasol_object_privilege" "r_on_schema" {
+  grantee     = exasol_role.r.name
+  privileges  = ["SELECT", "INSERT"]
+  object_type = "SCHEMA"
+  object_name = exasol_schema.s.name
+}
+resource "exasol_connection_grant" "c_to_r" {
+  connection_name = exasol_connection.c.name
+  grantee         = exasol_role.r.name
+}
+resource "exasol_user_impersonation_grant" "r_as_grantee" {
+  grantee = exasol_role.r.name
+  target  = exasol_user.other.name
+}
+resource "exasol_role_impersonation_grant" "r_as_target" {
+  grantee = exasol_user.u.name
+  target  = exasol_role.inner.name
+}`, suffix)
+	}
+	count := func(query string, want int) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			var n int
+			if err := db.QueryRow(query).Scan(&n); err != nil {
+				return fmt.Errorf("%s: %w", query, err)
+			}
+			if n != want {
+				return fmt.Errorf("%s: got %d, want %d", query, n, want)
+			}
+			return nil
+		}
+	}
+	grantsOn := func(suffix string) resource.TestCheckFunc {
+		return resource.ComposeAggregateTestCheckFunc(
+			count(fmt.Sprintf(`SELECT COUNT(*) FROM EXA_DBA_ROLE_PRIVS WHERE GRANTED_ROLE = 'ACC_REN_ROLE_%s' AND GRANTEE = 'ACC_REN_USER'`, suffix), 1),
+			count(fmt.Sprintf(`SELECT COUNT(*) FROM EXA_DBA_ROLE_PRIVS WHERE GRANTED_ROLE = 'ACC_REN_INNER_%[1]s' AND GRANTEE = 'ACC_REN_ROLE_%[1]s' AND ADMIN_OPTION IN ('TRUE', 'true', '1')`, suffix), 1),
+			count(fmt.Sprintf(`SELECT COUNT(*) FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE = 'ACC_REN_ROLE_%s' AND PRIVILEGE = 'CREATE TABLE'`, suffix), 1),
+			count(fmt.Sprintf(`SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_REN_ROLE_%[1]s' AND OBJECT_TYPE = 'SCHEMA' AND OBJECT_NAME = 'ACC_REN_SCHEMA_%[1]s'`, suffix), 2),
+			count(fmt.Sprintf(`SELECT COUNT(*) FROM EXA_DBA_CONNECTION_PRIVS WHERE GRANTED_CONNECTION = 'ACC_REN_CONN_%[1]s' AND GRANTEE = 'ACC_REN_ROLE_%[1]s'`, suffix), 1),
+			count(fmt.Sprintf(`SELECT COUNT(*) FROM EXA_DBA_IMPERSONATION_PRIVS WHERE GRANTEE = 'ACC_REN_ROLE_%s' AND IMPERSONATION_ON = 'ACC_REN_OTHER'`, suffix), 1),
+			count(fmt.Sprintf(`SELECT COUNT(*) FROM EXA_DBA_IMPERSONATION_PRIVS WHERE GRANTEE = 'ACC_REN_USER' AND IMPERSONATION_ON = 'ACC_REN_INNER_%s'`, suffix), 1),
+		)
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("A"),
+				Check:  grantsOn("A"),
+			},
+			{
+				Config: config("B"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("exasol_role.r", plancheck.ResourceActionUpdate),
+						plancheck.ExpectResourceAction("exasol_role.inner", plancheck.ResourceActionUpdate),
+						plancheck.ExpectResourceAction("exasol_schema.s", plancheck.ResourceActionUpdate),
+						plancheck.ExpectResourceAction("exasol_connection.c", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: grantsOn("B"),
+			},
+		},
+	})
+}
+
 // testAccCheckUserLogin checks the user's direct CREATE SESSION grant and
 // whether a login with the given password succeeds.
 func testAccCheckUserLogin(user, password string, wantLogin bool) resource.TestCheckFunc {
@@ -896,6 +1006,7 @@ resource "exasol_object_privilege" "test" {
 			for _, stmt := range []string{
 				`CREATE SCHEMA IF NOT EXISTS ACC_OBJTBL_SCHEMA`,
 				`CREATE OR REPLACE TABLE ACC_OBJTBL_SCHEMA.T1 (A INT)`,
+				"CREATE OR REPLACE LUA SCALAR SCRIPT ACC_OBJTBL_SCHEMA.S1() RETURNS INT AS\nfunction run(ctx) return 1 end\n/",
 			} {
 				if _, err := db.Exec(stmt); err != nil {
 					t.Fatalf("setup %q: %v", stmt, err)
@@ -918,6 +1029,45 @@ resource "exasol_object_privilege" "test" {
 			{
 				Config: providerConfig() + role,
 				Check:  tablePrivs(0),
+			},
+			// ALL on a table, EXECUTE on a script: no drift, and both revoked on removal
+			{
+				Config: providerConfig() + role + `
+resource "exasol_object_privilege" "all" {
+  grantee     = exasol_role.test.name
+  privileges  = ["ALL"]
+  object_type = "TABLE"
+  object_name = "ACC_OBJTBL_SCHEMA.T1"
+}
+resource "exasol_object_privilege" "script" {
+  grantee     = exasol_role.test.name
+  privileges  = ["EXECUTE"]
+  object_type = "SCRIPT"
+  object_name = "ACC_OBJTBL_SCHEMA.S1"
+}`,
+				Check: func(_ *terraform.State) error {
+					var n int
+					if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_OBJTBL_ROLE' AND OBJECT_SCHEMA = 'ACC_OBJTBL_SCHEMA' AND OBJECT_NAME = 'S1' AND PRIVILEGE = 'EXECUTE'`).Scan(&n); err != nil {
+						return err
+					}
+					if n != 1 {
+						return fmt.Errorf("script EXECUTE grants: got %d, want 1", n)
+					}
+					return nil
+				},
+			},
+			{
+				Config: providerConfig() + role,
+				Check: func(_ *terraform.State) error {
+					var n int
+					if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_OBJTBL_ROLE'`).Scan(&n); err != nil {
+						return err
+					}
+					if n != 0 {
+						return fmt.Errorf("object privileges left for ACC_OBJTBL_ROLE: %d", n)
+					}
+					return nil
+				},
 			},
 		},
 	})
