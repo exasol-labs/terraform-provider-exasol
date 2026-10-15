@@ -2243,6 +2243,73 @@ resource "exasol_object_privilege" "o" {
 	})
 }
 
+// An imported spelling "acc_crs" resolved to schema ACC_CRS; the schema is then
+// renamed to exactly that spelling while INSERT is dropped. The grant must end
+// up on the renamed schema with SELECT only.
+func TestAccObjectPrivilege_RenameToImportedSpelling(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(schema, privs string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "s" {
+  name = %q
+}
+resource "exasol_role" "r" {
+  name = "ACC_CRS_ROLE"
+}
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "SCHEMA"
+  object_name = "acc_crs"
+  depends_on  = [exasol_schema.s]
+}`, schema, privs)
+	}
+	base := providerConfig() + `
+resource "exasol_schema" "s" {
+  name = "ACC_CRS"
+}
+resource "exasol_role" "r" {
+  name = "ACC_CRS_ROLE"
+}`
+	both := `["SELECT", "INSERT"]`
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{Config: base},
+			{
+				PreConfig: func() {
+					for _, stmt := range []string{
+						`GRANT SELECT ON SCHEMA ACC_CRS TO ACC_CRS_ROLE`,
+						`GRANT INSERT ON SCHEMA ACC_CRS TO ACC_CRS_ROLE`,
+					} {
+						if _, err := db.Exec(stmt); err != nil {
+							t.Fatalf("grant outside Terraform %q: %v", stmt, err)
+						}
+					}
+				},
+				Config:             config("ACC_CRS", both),
+				ResourceName:       "exasol_object_privilege.o",
+				ImportState:        true,
+				ImportStateId:      "ACC_CRS_ROLE|SELECT,INSERT|SCHEMA|acc_crs",
+				ImportStatePersist: true,
+			},
+			// Refresh remembers ACC_CRS
+			{
+				Config: config("ACC_CRS", both),
+				Check:  objPrivs(db, "ACC_CRS_ROLE", "ACC_CRS", "INSERT,SELECT"),
+			},
+			// Rename ACC_CRS to "acc_crs" and drop INSERT in the same apply
+			{
+				Config: config("acc_crs", `["SELECT"]`),
+				Check:  objPrivs(db, "ACC_CRS_ROLE", "acc_crs", "SELECT"),
+			},
+		},
+	})
+}
+
 func TestAccObjectPrivilege_OnSchema(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },

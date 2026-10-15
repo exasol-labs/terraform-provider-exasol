@@ -238,11 +238,25 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 	// spelling: a case twin that appears later (e.g. "s" next to the "S" an
 	// imported spelling resolved to) must not take the grant over. A changed
 	// spelling is resolved like an unknown target, so GRANT below goes where
-	// the lookups go. A schema renamed away in this run while the spelling is
-	// unchanged is handled by objectRenamedAway below: the known target then
-	// is the name the new holder has.
+	// the lookups go.
+	//
+	// With an unchanged spelling, a schema of the known target renamed in this
+	// run is followed only if the new name is exactly the configured spelling
+	// (e.g. "S" renamed to "s" for an imported spelling "s"). Otherwise another
+	// object may have taken over the configured name (a swap), which
+	// objectRenamedAway below handles with the known target.
 	newTarget := oldTarget
-	if state.ObjectName.ValueString() != plan.ObjectName.ValueString() {
+	if state.ObjectName.ValueString() == plan.ObjectName.ValueString() {
+		schema, object, qualified := strings.Cut(oldTarget, ".")
+		if current, ok := r.renames.Lookup(exasolclient.RenameSchema, schema); ok {
+			if qualified {
+				current += "." + object
+			}
+			if current == unquotedName(plan.ObjectName.ValueString()) {
+				newTarget = current
+			}
+		}
+	} else {
 		var err error
 		newTarget, _, err = objectTarget(ctx, r.db, plan.ObjectName.ValueString())
 		if err != nil {
