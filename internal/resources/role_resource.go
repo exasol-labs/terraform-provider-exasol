@@ -17,7 +17,8 @@ import (
 
 // RoleResource manages Exasol roles.
 type RoleResource struct {
-	db *sql.DB
+	db      *sql.DB
+	renames *exasolclient.RenameLog
 }
 
 var _ resource.Resource = &RoleResource{}
@@ -33,7 +34,10 @@ func (r *RoleResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 	resp.Schema = schema.Schema{
 		Description: "Creates, renames and drops an Exasol role. " +
 			"Roles are stored in UPPERCASE inside Exasol, but the 'name' attribute " +
-			"preserves the exact spelling from the Terraform configuration.",
+			"preserves the exact spelling from the Terraform configuration. " +
+			"Renaming keeps its grants: Exasol moves them to the new name. When a grant that references it changes in the same apply, " +
+			"the provider revokes the previous grant under the new name. If the rename and the grant change land in different runs " +
+			"(-target, a failed apply, another provider alias, or a rename outside Terraform), check the renamed object for leftover grants.",
 		Attributes: map[string]schema.Attribute{
 			"name": schema.StringAttribute{
 				Required:    true,
@@ -53,6 +57,7 @@ func (r *RoleResource) Configure(_ context.Context, req resource.ConfigureReques
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.renames = c.Renames
 	}
 }
 
@@ -157,9 +162,17 @@ func (r *RoleResource) Update(ctx context.Context, req resource.UpdateRequest, r
 	}
 
 	if upNew != upOld {
+		// Hold the grant lock across RENAME and Record, so a grant Update either
+		// sees the rename in the log or revokes under the old name before it.
+		lockDelete()
 		stmt := fmt.Sprintf(`RENAME ROLE "%s" TO "%s"`, upOld, upNew)
 		tflog.Debug(ctx, "Renaming role", map[string]any{"sql": stmt})
-		if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+		_, err := r.db.ExecContext(ctx, stmt)
+		if err == nil {
+			r.renames.Record(exasolclient.RenamePrincipal, upOld, upNew)
+		}
+		unlockDelete()
+		if err != nil {
 			resp.Diagnostics.AddError("Error renaming role", err.Error())
 			return
 		}

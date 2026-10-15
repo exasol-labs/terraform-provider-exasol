@@ -5,6 +5,13 @@ resource "exasol_user" "analyst" {
   password  = var.analyst_password
 }
 
+# exasol_user grants no privileges, like Exasol's CREATE USER.
+# Grant CREATE SESSION explicitly so the user can log in.
+resource "exasol_system_privilege" "analyst_login" {
+  grantee   = exasol_user.analyst.name
+  privilege = "CREATE SESSION"
+}
+
 # LDAP authentication
 resource "exasol_user" "ldap_user" {
   name      = "LDAP_USER"

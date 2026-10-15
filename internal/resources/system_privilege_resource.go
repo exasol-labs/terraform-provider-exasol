@@ -21,7 +21,8 @@ var _ resource.ResourceWithImportState = &SystemPrivilegeResource{}
 // SystemPrivilegeResource manages Exasol system privileges.
 // System privileges include: CREATE SESSION, CREATE TABLE, CREATE SCHEMA, etc.
 type SystemPrivilegeResource struct {
-	db *sql.DB
+	db      *sql.DB
+	renames *exasolclient.RenameLog
 }
 
 func NewSystemPrivilegeResource() resource.Resource {
@@ -63,6 +64,7 @@ func (r *SystemPrivilegeResource) Configure(_ context.Context, req resource.Conf
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.renames = c.Renames
 	}
 }
 
@@ -152,6 +154,11 @@ func (r *SystemPrivilegeResource) Read(ctx context.Context, req resource.ReadReq
 }
 
 func (r *SystemPrivilegeResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	// Update may REVOKE; serialize it with Delete to avoid transaction
+	// collisions (40001), see delete_mutex.go.
+	lockDelete()
+	defer unlockDelete()
+
 	var plan, state systemPrivilegeModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -163,31 +170,71 @@ func (r *SystemPrivilegeResource) Update(ctx context.Context, req resource.Updat
 		return
 	}
 
-	// If grantee or privilege changed, need to revoke old and grant new
+	// If grantee or privilege changed, need to revoke old and grant new. A
+	// grantee renamed away in this run counts as changed even if the
+	// configured name is the same.
 	if plan.Grantee.ValueString() != state.Grantee.ValueString() ||
-		plan.Privilege.ValueString() != state.Privilege.ValueString() {
+		plan.Privilege.ValueString() != state.Privilege.ValueString() ||
+		renamedAway(r.renames, exasolclient.RenamePrincipal, state.Grantee.ValueString(), plan.Grantee.ValueString()) {
 
-		// Revoke old privilege
 		oldGrantee := strings.ToUpper(state.Grantee.ValueString())
 		oldPrivilege := strings.ToUpper(state.Privilege.ValueString())
-		revokeStmt := fmt.Sprintf(`REVOKE %s FROM "%s"`, oldPrivilege, oldGrantee)
-		tflog.Info(ctx, "Revoking old system privilege", map[string]any{"sql": revokeStmt})
-		if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
-			resp.Diagnostics.AddError("REVOKE failed", err.Error())
+		newGrantee := strings.ToUpper(plan.Grantee.ValueString())
+		newPrivilege := strings.ToUpper(plan.Privilege.ValueString())
+		if !requireExists(ctx, r.db, resp.Diagnostics.AddError, "Grantee", newGrantee, principalExists) {
 			return
 		}
 
-		// Grant new privilege
-		newGrantee := strings.ToUpper(plan.Grantee.ValueString())
-		newPrivilege := strings.ToUpper(plan.Privilege.ValueString())
-		grantStmt := fmt.Sprintf(`GRANT %s TO "%s"`, newPrivilege, newGrantee)
-		if !plan.WithAdminOption.IsNull() && plan.WithAdminOption.ValueBool() {
-			grantStmt += " WITH ADMIN OPTION"
-		}
-		tflog.Info(ctx, "Granting new system privilege", map[string]any{"sql": grantStmt})
-		if _, err := r.db.ExecContext(ctx, grantStmt); err != nil {
-			resp.Diagnostics.AddError("GRANT failed", err.Error())
+		// Find where the previous grant lives now: Exasol moves privileges to
+		// the new name when the grantee is renamed. Revoke it there unless it
+		// is the grant this resource keeps. A dropped grantee took its
+		// privileges with it.
+		curGrantee, gone, err := resolveEndpoint(ctx, r.db, r.renames, exasolclient.RenamePrincipal, oldGrantee, newGrantee, principalExists)
+		if err != nil {
+			resp.Diagnostics.AddError("Check grantee failed", err.Error())
 			return
+		}
+		if !gone && (curGrantee != newGrantee || oldPrivilege != newPrivilege) {
+			oldExists, _, err := r.privilegeExists(ctx, curGrantee, oldPrivilege)
+			if err != nil {
+				resp.Diagnostics.AddError("Check system privilege failed", err.Error())
+				return
+			}
+			if oldExists {
+				revokeStmt := fmt.Sprintf(`REVOKE %s FROM "%s"`, oldPrivilege, curGrantee)
+				tflog.Info(ctx, "Revoking old system privilege", map[string]any{"sql": revokeStmt})
+				if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+					resp.Diagnostics.AddError("REVOKE failed", err.Error())
+					return
+				}
+			}
+		}
+
+		wantAdmin := !plan.WithAdminOption.IsNull() && plan.WithAdminOption.ValueBool()
+		newExists, newAdmin, err := r.privilegeExists(ctx, newGrantee, newPrivilege)
+		if err != nil {
+			resp.Diagnostics.AddError("Check system privilege failed", err.Error())
+			return
+		}
+		if newExists && newAdmin != wantAdmin {
+			revokeStmt := fmt.Sprintf(`REVOKE %s FROM "%s"`, newPrivilege, newGrantee)
+			tflog.Info(ctx, "Revoking system privilege to update admin option", map[string]any{"sql": revokeStmt})
+			if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+				resp.Diagnostics.AddError("REVOKE failed", err.Error())
+				return
+			}
+			newExists = false
+		}
+		if !newExists {
+			grantStmt := fmt.Sprintf(`GRANT %s TO "%s"`, newPrivilege, newGrantee)
+			if wantAdmin {
+				grantStmt += " WITH ADMIN OPTION"
+			}
+			tflog.Info(ctx, "Granting new system privilege", map[string]any{"sql": grantStmt})
+			if _, err := r.db.ExecContext(ctx, grantStmt); err != nil {
+				resp.Diagnostics.AddError("GRANT failed", err.Error())
+				return
+			}
 		}
 	} else if plan.WithAdminOption.ValueBool() != state.WithAdminOption.ValueBool() {
 		// Only admin option changed - need to revoke and re-grant
@@ -233,6 +280,19 @@ func (r *SystemPrivilegeResource) Delete(ctx context.Context, req resource.Delet
 
 	grantee := strings.ToUpper(state.Grantee.ValueString())
 	privilege := strings.ToUpper(state.Privilege.ValueString())
+	// A grantee renamed in this run carries the grant to its new name.
+	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, grantee); ok {
+		grantee = current
+	}
+	// Already gone, e.g. the grantee was dropped: nothing to revoke.
+	exists, _, err := r.privilegeExists(ctx, grantee, privilege)
+	if err != nil {
+		resp.Diagnostics.AddError("Check system privilege failed", err.Error())
+		return
+	}
+	if !exists {
+		return
+	}
 	stmt := fmt.Sprintf(`REVOKE %s FROM "%s"`, privilege, grantee)
 
 	tflog.Info(ctx, "Revoking system privilege", map[string]any{"sql": stmt})
@@ -253,6 +313,22 @@ func (r *SystemPrivilegeResource) ImportState(ctx context.Context, req resource.
 	resp.State.SetAttribute(ctx, path.Root("privilege"), parts[1])
 	resp.State.SetAttribute(ctx, path.Root("with_admin_option"), strings.EqualFold(parts[2], "true"))
 	resp.State.SetAttribute(ctx, path.Root("id"), req.ID)
+}
+
+// privilegeExists reports whether grantee holds privilege directly, and with
+// which admin option.
+func (r *SystemPrivilegeResource) privilegeExists(ctx context.Context, grantee, privilege string) (bool, bool, error) {
+	var adminOption string
+	err := r.db.QueryRowContext(ctx,
+		`SELECT ADMIN_OPTION FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE = ? AND PRIVILEGE = ?`,
+		grantee, privilege).Scan(&adminOption)
+	if err == sql.ErrNoRows {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	return true, isTrueAdminOption(adminOption), nil
 }
 
 func systemPrivilegeID(m systemPrivilegeModel) string {

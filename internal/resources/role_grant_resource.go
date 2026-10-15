@@ -20,7 +20,8 @@ var _ resource.ResourceWithImportState = &RoleGrantResource{}
 
 // RoleGrantResource manages granting roles to users or other roles.
 type RoleGrantResource struct {
-	db *sql.DB
+	db      *sql.DB
+	renames *exasolclient.RenameLog
 }
 
 func NewRoleGrantResource() resource.Resource {
@@ -62,6 +63,7 @@ func (r *RoleGrantResource) Configure(_ context.Context, req resource.ConfigureR
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.renames = c.Renames
 	}
 }
 
@@ -155,6 +157,11 @@ func (r *RoleGrantResource) Read(ctx context.Context, req resource.ReadRequest, 
 }
 
 func (r *RoleGrantResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	// Update may REVOKE; serialize it with Delete to avoid transaction
+	// collisions (40001), see delete_mutex.go.
+	lockDelete()
+	defer unlockDelete()
+
 	var plan, state roleGrantModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -166,31 +173,78 @@ func (r *RoleGrantResource) Update(ctx context.Context, req resource.UpdateReque
 		return
 	}
 
-	// If role or grantee changed, need to revoke old and grant new
+	// If role or grantee changed, need to revoke old and grant new. A role or
+	// grantee renamed away in this run counts as changed even if the
+	// configured name is the same.
 	if plan.Role.ValueString() != state.Role.ValueString() ||
-		plan.Grantee.ValueString() != state.Grantee.ValueString() {
+		plan.Grantee.ValueString() != state.Grantee.ValueString() ||
+		renamedAway(r.renames, exasolclient.RenamePrincipal, state.Role.ValueString(), plan.Role.ValueString()) ||
+		renamedAway(r.renames, exasolclient.RenamePrincipal, state.Grantee.ValueString(), plan.Grantee.ValueString()) {
 
-		// Revoke old role grant
 		oldRole := strings.ToUpper(state.Role.ValueString())
 		oldGrantee := strings.ToUpper(state.Grantee.ValueString())
-		revokeStmt := fmt.Sprintf(`REVOKE "%s" FROM "%s"`, oldRole, oldGrantee)
-		tflog.Info(ctx, "Revoking old role grant", map[string]any{"sql": revokeStmt})
-		if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
-			resp.Diagnostics.AddError("REVOKE failed", err.Error())
+		newRole := strings.ToUpper(plan.Role.ValueString())
+		newGrantee := strings.ToUpper(plan.Grantee.ValueString())
+		if !requireExists(ctx, r.db, resp.Diagnostics.AddError, "Role", newRole, roleExists) ||
+			!requireExists(ctx, r.db, resp.Diagnostics.AddError, "Grantee", newGrantee, principalExists) {
 			return
 		}
 
-		// Grant new role
-		newRole := strings.ToUpper(plan.Role.ValueString())
-		newGrantee := strings.ToUpper(plan.Grantee.ValueString())
-		grantStmt := fmt.Sprintf(`GRANT "%s" TO "%s"`, newRole, newGrantee)
-		if !plan.WithAdminOption.IsNull() && plan.WithAdminOption.ValueBool() {
-			grantStmt += " WITH ADMIN OPTION"
-		}
-		tflog.Info(ctx, "Granting new role", map[string]any{"sql": grantStmt})
-		if _, err := r.db.ExecContext(ctx, grantStmt); err != nil {
-			resp.Diagnostics.AddError("GRANT failed", err.Error())
+		// Find where the previous grant lives now: Exasol moves grants to the
+		// new name when the role or grantee is renamed. Revoke it there unless
+		// it is the grant this resource keeps. A dropped role or grantee took
+		// the grant with it.
+		curRole, roleGone, err := resolveEndpoint(ctx, r.db, r.renames, exasolclient.RenamePrincipal, oldRole, newRole, roleExists)
+		if err != nil {
+			resp.Diagnostics.AddError("Check role failed", err.Error())
 			return
+		}
+		curGrantee, granteeGone, err := resolveEndpoint(ctx, r.db, r.renames, exasolclient.RenamePrincipal, oldGrantee, newGrantee, principalExists)
+		if err != nil {
+			resp.Diagnostics.AddError("Check grantee failed", err.Error())
+			return
+		}
+		if !roleGone && !granteeGone && (curRole != newRole || curGrantee != newGrantee) {
+			oldExists, _, err := r.grantExists(ctx, curRole, curGrantee)
+			if err != nil {
+				resp.Diagnostics.AddError("Check role grant failed", err.Error())
+				return
+			}
+			if oldExists {
+				revokeStmt := fmt.Sprintf(`REVOKE "%s" FROM "%s"`, curRole, curGrantee)
+				tflog.Info(ctx, "Revoking old role grant", map[string]any{"sql": revokeStmt})
+				if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+					resp.Diagnostics.AddError("REVOKE failed", err.Error())
+					return
+				}
+			}
+		}
+
+		wantAdmin := !plan.WithAdminOption.IsNull() && plan.WithAdminOption.ValueBool()
+		newExists, newAdmin, err := r.grantExists(ctx, newRole, newGrantee)
+		if err != nil {
+			resp.Diagnostics.AddError("Check role grant failed", err.Error())
+			return
+		}
+		if newExists && newAdmin != wantAdmin {
+			revokeStmt := fmt.Sprintf(`REVOKE "%s" FROM "%s"`, newRole, newGrantee)
+			tflog.Info(ctx, "Revoking role to update admin option", map[string]any{"sql": revokeStmt})
+			if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+				resp.Diagnostics.AddError("REVOKE failed", err.Error())
+				return
+			}
+			newExists = false
+		}
+		if !newExists {
+			grantStmt := fmt.Sprintf(`GRANT "%s" TO "%s"`, newRole, newGrantee)
+			if wantAdmin {
+				grantStmt += " WITH ADMIN OPTION"
+			}
+			tflog.Info(ctx, "Granting new role", map[string]any{"sql": grantStmt})
+			if _, err := r.db.ExecContext(ctx, grantStmt); err != nil {
+				resp.Diagnostics.AddError("GRANT failed", err.Error())
+				return
+			}
 		}
 	} else if plan.WithAdminOption.ValueBool() != state.WithAdminOption.ValueBool() {
 		// Only admin option changed - need to revoke and re-grant
@@ -236,6 +290,22 @@ func (r *RoleGrantResource) Delete(ctx context.Context, req resource.DeleteReque
 
 	role := strings.ToUpper(state.Role.ValueString())
 	grantee := strings.ToUpper(state.Grantee.ValueString())
+	// A role or grantee renamed in this run carries the grant to its new name.
+	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, role); ok {
+		role = current
+	}
+	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, grantee); ok {
+		grantee = current
+	}
+	// Already gone, e.g. the grantee was dropped: nothing to revoke.
+	exists, _, err := r.grantExists(ctx, role, grantee)
+	if err != nil {
+		resp.Diagnostics.AddError("Check role grant failed", err.Error())
+		return
+	}
+	if !exists {
+		return
+	}
 	stmt := fmt.Sprintf(`REVOKE "%s" FROM "%s"`, role, grantee)
 
 	tflog.Info(ctx, "Revoking role grant", map[string]any{"sql": stmt})
@@ -266,4 +336,20 @@ func roleGrantID(m roleGrantModel) string {
 		adminOption = "true"
 	}
 	return fmt.Sprintf("%s|%s|%s", role, grantee, adminOption)
+}
+
+// grantExists reports whether role is granted to grantee, and with which admin
+// option.
+func (r *RoleGrantResource) grantExists(ctx context.Context, role, grantee string) (bool, bool, error) {
+	var adminOption string
+	err := r.db.QueryRowContext(ctx,
+		`SELECT ADMIN_OPTION FROM EXA_DBA_ROLE_PRIVS WHERE GRANTED_ROLE = ? AND GRANTEE = ?`,
+		role, grantee).Scan(&adminOption)
+	if err == sql.ErrNoRows {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	return true, isTrueAdminOption(adminOption), nil
 }

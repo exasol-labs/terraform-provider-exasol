@@ -17,11 +17,13 @@ import (
 
 var _ resource.Resource = &UserResource{}
 var _ resource.ResourceWithImportState = &UserResource{}
+var _ resource.ResourceWithModifyPlan = &UserResource{}
 
 // UserResource manages Exasol database users.
 // It supports password, LDAP and OpenID authentication types.
 type UserResource struct {
-	db *sql.DB
+	db      *sql.DB
+	renames *exasolclient.RenameLog
 }
 
 func NewUserResource() resource.Resource { return &UserResource{} }
@@ -32,7 +34,12 @@ func (r *UserResource) Metadata(_ context.Context, req resource.MetadataRequest,
 
 func (r *UserResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Creates, updates (rename / change auth) and drops an Exasol user.",
+		Description: "Creates, updates (rename / change auth) and drops an Exasol user. " +
+			"Like Exasol's CREATE USER, it grants no privileges: grant CREATE SESSION with " +
+			"exasol_system_privilege so the user can log in. " +
+			"Renaming keeps its grants: Exasol moves them to the new name. When a grant that references it changes in the same apply, " +
+			"the provider revokes the previous grant under the new name. If the rename and the grant change land in different runs " +
+			"(-target, a failed apply, another provider alias, or a rename outside Terraform), check the renamed object for leftover grants.",
 		Attributes: map[string]schema.Attribute{
 			"name": schema.StringAttribute{
 				Required:    true,
@@ -63,12 +70,29 @@ func (r *UserResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 	}
 }
 
+// ModifyPlan warns when a user is about to be created. Up to v0.2.x the
+// provider granted CREATE SESSION implicitly; configurations that relied on it
+// need an exasol_system_privilege resource now, or the new user cannot log in.
+// Remove this warning in v0.4.0, once the migration window has passed.
+func (r *UserResource) ModifyPlan(_ context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if !req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
+		return
+	}
+	resp.Diagnostics.AddWarning(
+		"exasol_user no longer grants CREATE SESSION",
+		"Since v0.3.0, exasol_user only runs CREATE USER, like Exasol itself. "+
+			"If this user needs to log in, add an exasol_system_privilege resource "+
+			"with privilege = \"CREATE SESSION\". Existing users keep their grant.",
+	)
+}
+
 func (r *UserResource) Configure(_ context.Context, req resource.ConfigureRequest, _ *resource.ConfigureResponse) {
 	if req.ProviderData == nil {
 		return
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.renames = c.Renames
 	}
 }
 
@@ -108,14 +132,6 @@ func (r *UserResource) Create(ctx context.Context, req resource.CreateRequest, r
 	tflog.Info(ctx, "Creating user", map[string]any{"sql": sanitizeLogSQL(sqlStmt)})
 	if _, err := r.db.ExecContext(ctx, sqlStmt); err != nil {
 		resp.Diagnostics.AddError("CREATE USER failed", err.Error())
-		return
-	}
-
-	// also grant CREATE SESSION so user can log in
-	escapedName := escapeIdentifierLiteral(upName)
-	grant := fmt.Sprintf(`GRANT CREATE SESSION TO "%s"`, escapedName)
-	if _, err := r.db.ExecContext(ctx, grant); err != nil {
-		resp.Diagnostics.AddError("Grant CREATE SESSION failed", err.Error())
 		return
 	}
 
@@ -207,9 +223,17 @@ func (r *UserResource) Update(ctx context.Context, req resource.UpdateRequest, r
 	escapedNew := escapeIdentifierLiteral(upNew)
 
 	if upOld != upNew {
+		// Hold the grant lock across RENAME and Record, so a grant Update either
+		// sees the rename in the log or revokes under the old name before it.
+		lockDelete()
 		stmt := fmt.Sprintf(`RENAME USER "%s" TO "%s"`, escapedOld, escapedNew)
 		tflog.Info(ctx, "Renaming user", map[string]any{"sql": stmt})
-		if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+		_, err := r.db.ExecContext(ctx, stmt)
+		if err == nil {
+			r.renames.Record(exasolclient.RenamePrincipal, upOld, upNew)
+		}
+		unlockDelete()
+		if err != nil {
 			resp.Diagnostics.AddError("RENAME USER failed", err.Error())
 			return
 		}
