@@ -33,4 +33,13 @@ func TestRenameLog(t *testing.T) {
 	if _, ok := nilLog.Lookup(RenameSchema, "S"); ok {
 		t.Fatal("nil log returned a rename")
 	}
+
+	// Schema names keep their case: "a" and "A" are different schemas
+	l.Record(RenameSchema, "a", "b")
+	if _, ok := l.Lookup(RenameSchema, "A"); ok {
+		t.Fatal("rename of schema a matched schema A")
+	}
+	if got, _ := l.Lookup(RenameSchema, "a"); got != "b" {
+		t.Fatalf("schema a resolves to %q, want b", got)
+	}
 }

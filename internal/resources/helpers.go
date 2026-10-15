@@ -72,7 +72,13 @@ func resolveEndpoint(ctx context.Context, db *sql.DB, renames *exasolclient.Rena
 // configured name is unchanged, but the grant has to be reconciled as moved.
 func renamedAway(renames *exasolclient.RenameLog, kind, oldName, newName string) bool {
 	current, ok := renames.Lookup(kind, oldName)
-	return ok && current != strings.ToUpper(newName)
+	if !ok {
+		return false
+	}
+	if kind == exasolclient.RenameSchema {
+		return current != newName
+	}
+	return current != strings.ToUpper(newName)
 }
 
 // objectRenamedAway does the same for the schema of an object privilege target.

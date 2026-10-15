@@ -33,7 +33,18 @@ type RenameLog struct {
 
 func NewRenameLog() *RenameLog { return &RenameLog{m: map[string]string{}} }
 
-func renameKey(kind, name string) string { return kind + "|" + strings.ToUpper(name) }
+// normalize returns the name as Exasol compares it for kind. The provider
+// uppercases user, role and connection names, but creates and renames schemas
+// with the case as configured, and quoted schema names are case-sensitive in
+// Exasol ("A" and "a" can coexist).
+func normalize(kind, name string) string {
+	if kind == RenameSchema {
+		return name
+	}
+	return strings.ToUpper(name)
+}
+
+func renameKey(kind, name string) string { return kind + "|" + normalize(kind, name) }
 
 // Record notes that kind oldName was renamed to newName. A later rename of
 // newName is followed, so old names always resolve to the latest name.
@@ -43,7 +54,7 @@ func (l *RenameLog) Record(kind, oldName, newName string) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	newName = strings.ToUpper(newName)
+	newName = normalize(kind, newName)
 	oldKey := renameKey(kind, oldName)
 	// Follow chains: whatever pointed at oldName now points at newName. An
 	// entry for an object that was renamed away from newName stays, because

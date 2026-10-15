@@ -1113,6 +1113,60 @@ resource "exasol_object_privilege" "o" {
 	})
 }
 
+// Renaming a lowercase schema must not affect grants on its uppercase twin:
+// quoted schema names are case-sensitive in Exasol.
+func TestAccRename_SchemaCaseTwin(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(lowerName, privs string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "upper" {
+  name = "ACC_TWIN_SCHEMA"
+}
+resource "exasol_schema" "lower" {
+  name = %q
+}
+resource "exasol_role" "r" {
+  name = "ACC_TWIN_ROLE"
+}
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "SCHEMA"
+  object_name = exasol_schema.upper.name
+  depends_on  = [exasol_schema.lower]
+}`, lowerName, privs)
+	}
+	privs := func(want string) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			var got string
+			if err := db.QueryRow(`SELECT COALESCE(GROUP_CONCAT(OBJECT_NAME || ':' || PRIVILEGE ORDER BY OBJECT_NAME, PRIVILEGE), '') FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_TWIN_ROLE'`).Scan(&got); err != nil {
+				return err
+			}
+			if got != want {
+				return fmt.Errorf("object privileges of ACC_TWIN_ROLE: got %q, want %q", got, want)
+			}
+			return nil
+		}
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("acc_twin_schema", `["SELECT", "INSERT"]`),
+				Check:  privs("ACC_TWIN_SCHEMA:INSERT,ACC_TWIN_SCHEMA:SELECT"),
+			},
+			// Rename the lowercase twin and drop INSERT on the uppercase schema
+			{
+				Config: config("acc_twin_schema2", `["SELECT"]`),
+				Check:  privs("ACC_TWIN_SCHEMA:SELECT"),
+			},
+		},
+	})
+}
+
 // testAccCheckUserLogin checks the user's direct CREATE SESSION grant and
 // whether a login with the given password succeeds.
 func testAccCheckUserLogin(user, password string, wantLogin bool) resource.TestCheckFunc {
