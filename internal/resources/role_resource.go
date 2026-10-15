@@ -17,7 +17,8 @@ import (
 
 // RoleResource manages Exasol roles.
 type RoleResource struct {
-	db *sql.DB
+	db      *sql.DB
+	renames *exasolclient.RenameLog
 }
 
 var _ resource.Resource = &RoleResource{}
@@ -53,6 +54,7 @@ func (r *RoleResource) Configure(_ context.Context, req resource.ConfigureReques
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.renames = c.Renames
 	}
 }
 
@@ -163,6 +165,7 @@ func (r *RoleResource) Update(ctx context.Context, req resource.UpdateRequest, r
 			resp.Diagnostics.AddError("Error renaming role", err.Error())
 			return
 		}
+		r.renames.Record(exasolclient.RenamePrincipal, upOld, upNew)
 	}
 
 	// Update id to match DB, keep name as in user config

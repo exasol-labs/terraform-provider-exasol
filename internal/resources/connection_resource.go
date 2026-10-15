@@ -21,7 +21,8 @@ var _ resource.ResourceWithImportState = &ConnectionResource{}
 // ConnectionResource manages Exasol database connections.
 // Connections are used for IMPORT/EXPORT and can connect to various external systems.
 type ConnectionResource struct {
-	db *sql.DB
+	db      *sql.DB
+	renames *exasolclient.RenameLog
 }
 
 func NewConnectionResource() resource.Resource {
@@ -70,6 +71,7 @@ func (r *ConnectionResource) Configure(_ context.Context, req resource.Configure
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.renames = c.Renames
 	}
 }
 
@@ -196,6 +198,7 @@ func (r *ConnectionResource) Update(ctx context.Context, req resource.UpdateRequ
 			resp.Diagnostics.AddError("RENAME CONNECTION failed", err.Error())
 			return
 		}
+		r.renames.Record(exasolclient.RenameConnection, upOld, upNew)
 	}
 
 	// Check if connection properties changed

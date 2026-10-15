@@ -21,7 +21,8 @@ var _ resource.ResourceWithImportState = &SystemPrivilegeResource{}
 // SystemPrivilegeResource manages Exasol system privileges.
 // System privileges include: CREATE SESSION, CREATE TABLE, CREATE SCHEMA, etc.
 type SystemPrivilegeResource struct {
-	db *sql.DB
+	db      *sql.DB
+	renames *exasolclient.RenameLog
 }
 
 func NewSystemPrivilegeResource() resource.Resource {
@@ -63,6 +64,7 @@ func (r *SystemPrivilegeResource) Configure(_ context.Context, req resource.Conf
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.renames = c.Renames
 	}
 }
 
@@ -152,6 +154,11 @@ func (r *SystemPrivilegeResource) Read(ctx context.Context, req resource.ReadReq
 }
 
 func (r *SystemPrivilegeResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	// Update may REVOKE; serialize it with Delete to avoid transaction
+	// collisions (40001), see delete_mutex.go.
+	lockDelete()
+	defer unlockDelete()
+
 	var plan, state systemPrivilegeModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -167,26 +174,36 @@ func (r *SystemPrivilegeResource) Update(ctx context.Context, req resource.Updat
 	if plan.Grantee.ValueString() != state.Grantee.ValueString() ||
 		plan.Privilege.ValueString() != state.Privilege.ValueString() {
 
-		// Renaming the grantee in Exasol moves its privileges to the new name,
-		// so the old grant may be gone and the new one may already exist.
 		oldGrantee := strings.ToUpper(state.Grantee.ValueString())
 		oldPrivilege := strings.ToUpper(state.Privilege.ValueString())
-		oldExists, _, err := r.privilegeExists(ctx, oldGrantee, oldPrivilege)
+		newGrantee := strings.ToUpper(plan.Grantee.ValueString())
+		newPrivilege := strings.ToUpper(plan.Privilege.ValueString())
+
+		// Find where the previous grant lives now: Exasol moves privileges to
+		// the new name when the grantee is renamed. Revoke it there unless it
+		// is the grant this resource keeps. A dropped grantee took its
+		// privileges with it.
+		curGrantee, gone, err := resolveEndpoint(ctx, r.db, r.renames, exasolclient.RenamePrincipal, oldGrantee, newGrantee, principalExists)
 		if err != nil {
-			resp.Diagnostics.AddError("Check system privilege failed", err.Error())
+			resp.Diagnostics.AddError("Check grantee failed", err.Error())
 			return
 		}
-		if oldExists {
-			revokeStmt := fmt.Sprintf(`REVOKE %s FROM "%s"`, oldPrivilege, oldGrantee)
-			tflog.Info(ctx, "Revoking old system privilege", map[string]any{"sql": revokeStmt})
-			if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
-				resp.Diagnostics.AddError("REVOKE failed", err.Error())
+		if !gone && (curGrantee != newGrantee || oldPrivilege != newPrivilege) {
+			oldExists, _, err := r.privilegeExists(ctx, curGrantee, oldPrivilege)
+			if err != nil {
+				resp.Diagnostics.AddError("Check system privilege failed", err.Error())
 				return
+			}
+			if oldExists {
+				revokeStmt := fmt.Sprintf(`REVOKE %s FROM "%s"`, oldPrivilege, curGrantee)
+				tflog.Info(ctx, "Revoking old system privilege", map[string]any{"sql": revokeStmt})
+				if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+					resp.Diagnostics.AddError("REVOKE failed", err.Error())
+					return
+				}
 			}
 		}
 
-		newGrantee := strings.ToUpper(plan.Grantee.ValueString())
-		newPrivilege := strings.ToUpper(plan.Privilege.ValueString())
 		wantAdmin := !plan.WithAdminOption.IsNull() && plan.WithAdminOption.ValueBool()
 		newExists, newAdmin, err := r.privilegeExists(ctx, newGrantee, newPrivilege)
 		if err != nil {
@@ -257,7 +274,11 @@ func (r *SystemPrivilegeResource) Delete(ctx context.Context, req resource.Delet
 
 	grantee := strings.ToUpper(state.Grantee.ValueString())
 	privilege := strings.ToUpper(state.Privilege.ValueString())
-	// Already gone, e.g. the grantee was renamed or dropped: nothing to revoke.
+	// A grantee renamed in this run carries the grant to its new name.
+	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, grantee); ok {
+		grantee = current
+	}
+	// Already gone, e.g. the grantee was dropped: nothing to revoke.
 	exists, _, err := r.privilegeExists(ctx, grantee, privilege)
 	if err != nil {
 		resp.Diagnostics.AddError("Check system privilege failed", err.Error())

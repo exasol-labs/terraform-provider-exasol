@@ -12,8 +12,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - A user replaced with `-replace` or `taint` is created without `CREATE SESSION`. No warning is shown in this case, because Terraform passes the prior state to the provider
 
 ### Fixed
-- Renaming a user, role or connection no longer fails in `exasol_system_privilege`, `exasol_role_grant`, `exasol_object_privilege`, `exasol_connection_grant`, `exasol_user_impersonation_grant` and `exasol_role_impersonation_grant`. Exasol moves grants to the new name itself; these resources now revoke a grant only if it still exists and skip the grant if it already exists. `Delete` also no longer fails when the grant is already gone
+- Renaming a user, role, connection or schema that grants reference no longer fails in `exasol_system_privilege`, `exasol_role_grant`, `exasol_object_privilege`, `exasol_connection_grant`, `exasol_user_impersonation_grant` and `exasol_role_impersonation_grant`, and no longer leaves grants behind. Exasol moves grants to the new name itself. The provider now records the renames it executes in an apply, so the grant resources know where a previous grant lives and revoke it there when the grant changes in the same apply (another privilege, role, connection, target, object or privilege list, or another grantee). `Delete` no longer fails when the grant is already gone
+  - Limit: a rename done outside Terraform, followed by an apply with `-refresh=false`, cannot be detected; Exasol has no stable ID for users, roles and connections. With a normal refresh, such grants are dropped from state and created again
 - `exasol_object_privilege` on a table or view (`object_name = "SCHEMA.TABLE"`) is found again on refresh. Exasol stores the schema and the object name in separate columns, so the lookup never matched: every plan wanted to create the grant again. Schema grants were not affected
+- `exasol_object_privilege`: moving an `ALL` grant to a grantee that already holds one of its privileges now grants all of them
+- `exasol_object_privilege`: an object name stored in lowercase (for example by an import) no longer makes `REVOKE` fail; lookup and `REVOKE` use the same uppercase name. A failed `REVOKE` during an update is now an error instead of a log warning
+- Grant updates are serialized with deletes, like deletes already were, to avoid Exasol transaction collisions (error 40001)
 
 ## [0.2.5] - 2026-09-16
 

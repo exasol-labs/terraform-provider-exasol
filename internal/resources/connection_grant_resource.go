@@ -20,7 +20,8 @@ var _ resource.ResourceWithImportState = &ConnectionGrantResource{}
 
 // ConnectionGrantResource manages GRANT CONNECTION ... TO ... statements.
 type ConnectionGrantResource struct {
-	db *sql.DB
+	db      *sql.DB
+	renames *exasolclient.RenameLog
 }
 
 func NewConnectionGrantResource() resource.Resource {
@@ -59,6 +60,7 @@ func (r *ConnectionGrantResource) Configure(_ context.Context, req resource.Conf
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.renames = c.Renames
 	}
 }
 
@@ -143,6 +145,11 @@ func (r *ConnectionGrantResource) Read(ctx context.Context, req resource.ReadReq
 }
 
 func (r *ConnectionGrantResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	// Update may REVOKE; serialize it with Delete to avoid transaction
+	// collisions (40001), see delete_mutex.go.
+	lockDelete()
+	defer unlockDelete()
+
 	var plan, state connectionGrantModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -167,19 +174,33 @@ func (r *ConnectionGrantResource) Update(ctx context.Context, req resource.Updat
 
 	// If either changed, revoke old grant and create new one
 	if oldConnection != newConnection || oldGrantee != newGrantee {
-		// Renaming the grantee in Exasol moves the grant to the new name, so
-		// the old grant may be gone and the new one may already exist.
-		oldExists, err := r.grantExists(ctx, oldConnection, oldGrantee)
+		// Find where the previous grant lives now: Exasol moves grants to the
+		// new name when the connection or grantee is renamed. Revoke it there
+		// unless it is the grant this resource keeps. A dropped connection or
+		// grantee took the grant with it.
+		curConnection, connGone, err := resolveEndpoint(ctx, r.db, r.renames, exasolclient.RenameConnection, oldConnection, newConnection, connectionExists)
 		if err != nil {
-			resp.Diagnostics.AddError("Check connection grant failed", err.Error())
+			resp.Diagnostics.AddError("Check connection failed", err.Error())
 			return
 		}
-		if oldExists {
-			revokeStmt := fmt.Sprintf(`REVOKE CONNECTION "%s" FROM "%s"`, oldConnection, oldGrantee)
-			tflog.Info(ctx, "Revoking old connection grant", map[string]any{"sql": revokeStmt})
-			if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
-				resp.Diagnostics.AddError("REVOKE CONNECTION failed", err.Error())
+		curGrantee, granteeGone, err := resolveEndpoint(ctx, r.db, r.renames, exasolclient.RenamePrincipal, oldGrantee, newGrantee, principalExists)
+		if err != nil {
+			resp.Diagnostics.AddError("Check grantee failed", err.Error())
+			return
+		}
+		if !connGone && !granteeGone && (curConnection != newConnection || curGrantee != newGrantee) {
+			oldExists, err := r.grantExists(ctx, curConnection, curGrantee)
+			if err != nil {
+				resp.Diagnostics.AddError("Check connection grant failed", err.Error())
 				return
+			}
+			if oldExists {
+				revokeStmt := fmt.Sprintf(`REVOKE CONNECTION "%s" FROM "%s"`, curConnection, curGrantee)
+				tflog.Info(ctx, "Revoking old connection grant", map[string]any{"sql": revokeStmt})
+				if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+					resp.Diagnostics.AddError("REVOKE CONNECTION failed", err.Error())
+					return
+				}
 			}
 		}
 
@@ -226,7 +247,15 @@ func (r *ConnectionGrantResource) Delete(ctx context.Context, req resource.Delet
 		return
 	}
 
-	// Already gone, e.g. the grantee was renamed or dropped: nothing to revoke.
+	// A connection or grantee renamed in this run carries the grant to its
+	// new name.
+	if current, ok := r.renames.Lookup(exasolclient.RenameConnection, connection); ok {
+		connection = current
+	}
+	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, grantee); ok {
+		grantee = current
+	}
+	// Already gone, e.g. the grantee was dropped: nothing to revoke.
 	exists, err := r.grantExists(ctx, connection, grantee)
 	if err != nil {
 		resp.Diagnostics.AddError("Check connection grant failed", err.Error())

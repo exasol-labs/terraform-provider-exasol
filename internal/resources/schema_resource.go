@@ -19,7 +19,8 @@ var _ resource.ResourceWithImportState = &SchemaResource{}
 
 // SchemaResource manages Exasol schemas.
 type SchemaResource struct {
-	db *sql.DB
+	db      *sql.DB
+	renames *exasolclient.RenameLog
 }
 
 func NewSchemaResource() resource.Resource {
@@ -57,6 +58,7 @@ func (r *SchemaResource) Configure(_ context.Context, req resource.ConfigureRequ
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.renames = c.Renames
 	}
 }
 
@@ -200,6 +202,7 @@ func (r *SchemaResource) Update(ctx context.Context, req resource.UpdateRequest,
 			resp.Diagnostics.AddError("RENAME SCHEMA failed", err.Error())
 			return
 		}
+		r.renames.Record(exasolclient.RenameSchema, oldName, newName)
 	}
 
 	// Handle ownership change

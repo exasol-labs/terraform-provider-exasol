@@ -2,7 +2,8 @@ package resources
 
 import "sync"
 
-// deleteMutex serializes all delete operations to prevent transaction collision errors (40001)
+// deleteMutex serializes all delete operations, and grant updates that revoke,
+// to prevent transaction collision errors (40001)
 // in Exasol when multiple REVOKE/DROP statements execute simultaneously.
 //
 // A future improvement would be retry logic with exponential backoff for error 40001,

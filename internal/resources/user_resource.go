@@ -22,7 +22,8 @@ var _ resource.ResourceWithModifyPlan = &UserResource{}
 // UserResource manages Exasol database users.
 // It supports password, LDAP and OpenID authentication types.
 type UserResource struct {
-	db *sql.DB
+	db      *sql.DB
+	renames *exasolclient.RenameLog
 }
 
 func NewUserResource() resource.Resource { return &UserResource{} }
@@ -88,6 +89,7 @@ func (r *UserResource) Configure(_ context.Context, req resource.ConfigureReques
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.renames = c.Renames
 	}
 }
 
@@ -224,6 +226,7 @@ func (r *UserResource) Update(ctx context.Context, req resource.UpdateRequest, r
 			resp.Diagnostics.AddError("RENAME USER failed", err.Error())
 			return
 		}
+		r.renames.Record(exasolclient.RenamePrincipal, upOld, upNew)
 	}
 
 	// Change authentication if type/params changed
