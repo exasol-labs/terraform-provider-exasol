@@ -1937,6 +1937,66 @@ resource "exasol_object_privilege" "low" {
 	})
 }
 
+// A table grant follows a schema rename in the same apply: the previous
+// privilege removed from the list is revoked on the renamed schema's table.
+func TestAccObjectPrivilege_TableAfterSchemaRename(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(schema, privs string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "s" {
+  name = %q
+}
+resource "exasol_role" "r" {
+  name = "ACC_TSR_ROLE"
+}
+resource "exasol_object_privilege" "t" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "TABLE"
+  object_name = "${exasol_schema.s.name}.T1"
+}`, schema, privs)
+	}
+	privs := func(schema, want string) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			var got sql.NullString
+			if err := db.QueryRow(`SELECT GROUP_CONCAT(PRIVILEGE ORDER BY PRIVILEGE) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_TSR_ROLE' AND OBJECT_SCHEMA = ? AND OBJECT_NAME = 'T1'`, schema).Scan(&got); err != nil {
+				return err
+			}
+			if got.String != want {
+				return fmt.Errorf("privileges on %s.T1: got %q, want %q", schema, got.String, want)
+			}
+			return nil
+		}
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: providerConfig() + `
+resource "exasol_schema" "s" {
+  name = "ACC_TSR_SCHEMA"
+}`,
+				Check: func(_ *terraform.State) error {
+					_, err := db.Exec(`CREATE TABLE ACC_TSR_SCHEMA.T1 (A INT)`)
+					return err
+				},
+			},
+			{
+				Config: config("ACC_TSR_SCHEMA", `["SELECT", "INSERT"]`),
+				Check:  privs("ACC_TSR_SCHEMA", "INSERT,SELECT"),
+			},
+			// Rename the schema and drop INSERT in the same apply
+			{
+				Config: config("ACC_TSR_SCHEMA2", `["SELECT"]`),
+				Check:  resource.ComposeAggregateTestCheckFunc(privs("ACC_TSR_SCHEMA2", "SELECT"), privs("ACC_TSR_SCHEMA", "")),
+			},
+		},
+	})
+}
+
 func TestAccObjectPrivilege_OnSchema(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
