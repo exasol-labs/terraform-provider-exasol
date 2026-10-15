@@ -145,5 +145,7 @@ func objectExists(ctx context.Context, db *sql.DB, name string) (bool, error) {
 	if schema, object, qualified := strings.Cut(unquoted, "."); qualified {
 		return rowExists(ctx, db, `SELECT 1 FROM EXA_DBA_OBJECTS WHERE ROOT_NAME = ? AND OBJECT_NAME = ?`, schema, object)
 	}
-	return rowExists(ctx, db, `SELECT 1 FROM EXA_SCHEMAS WHERE SCHEMA_NAME = ?`, unquoted)
+	// EXA_DBA_SCHEMAS lists every schema, independent of the provider user's
+	// access to it, like the other EXA_DBA_* views the provider uses.
+	return rowExists(ctx, db, `SELECT 1 FROM EXA_DBA_SCHEMAS WHERE SCHEMA_NAME = ?`, unquoted)
 }
