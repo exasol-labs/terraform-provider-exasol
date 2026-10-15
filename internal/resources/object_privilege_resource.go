@@ -224,10 +224,7 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 	newGrantee := strings.ToUpper(plan.Grantee.ValueString())
 	oldObjectType := strings.ToUpper(state.ObjectType.ValueString())
 	newObjectType := strings.ToUpper(plan.ObjectType.ValueString())
-	// The old target is the known one from private state (see Read). The new
-	// one is the configured spelling resolved like an unknown target, so a
-	// lowercase spelling of an uppercase object (e.g. after an import) is the
-	// same object, and GRANT below goes where the lookups go.
+	// The old target is the known one from private state (see Read).
 	oldTarget, known := knownObjectTarget(ctx, req.Private)
 	if !known {
 		var err error
@@ -237,10 +234,21 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 			return
 		}
 	}
-	newTarget, _, err := objectTarget(ctx, r.db, plan.ObjectName.ValueString())
-	if err != nil {
-		resp.Diagnostics.AddError("Check object failed", err.Error())
-		return
+	// The new target stays the known one while object_name keeps its
+	// spelling: a case twin that appears later (e.g. "s" next to the "S" an
+	// imported spelling resolved to) must not take the grant over. A changed
+	// spelling is resolved like an unknown target, so GRANT below goes where
+	// the lookups go. A schema renamed away in this run while the spelling is
+	// unchanged is handled by objectRenamedAway below: the known target then
+	// is the name the new holder has.
+	newTarget := oldTarget
+	if state.ObjectName.ValueString() != plan.ObjectName.ValueString() {
+		var err error
+		newTarget, _, err = objectTarget(ctx, r.db, plan.ObjectName.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddError("Check object failed", err.Error())
+			return
+		}
 	}
 	newObjectName := qualify(newTarget)
 

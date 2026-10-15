@@ -2130,6 +2130,119 @@ resource "exasol_role" "r" {
 	})
 }
 
+// A grant imported with the spelling "acc_tai_s" for schema ACC_TAI_S stays
+// on ACC_TAI_S when a separate schema "acc_tai_s" appears later and only the
+// privileges change.
+func TestAccObjectPrivilege_CaseTwinAppearsAfterImport(t *testing.T) {
+	db := testAccDB(t)
+	base := providerConfig() + `
+resource "exasol_role" "r" {
+  name = "ACC_TAI_ROLE"
+}`
+	grant := func(privs string) string {
+		return fmt.Sprintf(`
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "SCHEMA"
+  object_name = "acc_tai_s"
+}`, privs)
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			if _, err := db.Exec(`CREATE SCHEMA IF NOT EXISTS ACC_TAI_S`); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+			t.Cleanup(func() {
+				_, _ = db.Exec(`DROP SCHEMA IF EXISTS "acc_tai_s" CASCADE`)
+				_, _ = db.Exec(`DROP SCHEMA IF EXISTS ACC_TAI_S CASCADE`)
+				db.Close()
+			})
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{Config: base},
+			{
+				PreConfig: func() {
+					if _, err := db.Exec(`GRANT SELECT ON SCHEMA ACC_TAI_S TO ACC_TAI_ROLE`); err != nil {
+						t.Fatalf("grant outside Terraform: %v", err)
+					}
+				},
+				Config:             base + grant(`["SELECT"]`),
+				ResourceName:       "exasol_object_privilege.o",
+				ImportState:        true,
+				ImportStateId:      "ACC_TAI_ROLE|SELECT|SCHEMA|acc_tai_s",
+				ImportStatePersist: true,
+			},
+			// Refresh resolves and remembers ACC_TAI_S
+			{
+				Config: base + grant(`["SELECT"]`),
+				Check:  objPrivs(db, "ACC_TAI_ROLE", "ACC_TAI_S", "SELECT"),
+			},
+			// The lowercase twin appears; only the privileges change
+			{
+				PreConfig: func() {
+					if _, err := db.Exec(`CREATE SCHEMA "acc_tai_s"`); err != nil {
+						t.Fatalf("create twin: %v", err)
+					}
+				},
+				Config: base + grant(`["SELECT", "INSERT"]`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					objPrivs(db, "ACC_TAI_ROLE", "ACC_TAI_S", "INSERT,SELECT"),
+					objPrivs(db, "ACC_TAI_ROLE", "acc_tai_s", ""),
+				),
+			},
+		},
+	})
+}
+
+// Schema swap with an unchanged spelling: schema a is renamed S to S2, then
+// schema b B to S, and the grant moves from a to b while dropping INSERT.
+// object_name stays "ACC_SWS_S", but it names schema b now.
+func TestAccObjectPrivilege_SchemaSwapSameSpelling(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(aName, bName, holder, privs string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "a" {
+  name = %q
+}
+resource "exasol_schema" "b" {
+  name       = %q
+  depends_on = [exasol_schema.a]
+}
+resource "exasol_role" "r" {
+  name = "ACC_SWS_ROLE"
+}
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "SCHEMA"
+  object_name = exasol_schema.%s.name
+}`, aName, bName, privs, holder)
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("ACC_SWS_S", "ACC_SWS_B", "a", `["SELECT", "INSERT"]`),
+				Check:  objPrivs(db, "ACC_SWS_ROLE", "ACC_SWS_S", "INSERT,SELECT"),
+			},
+			{
+				Config: config("ACC_SWS_S2", "ACC_SWS_S", "b", `["SELECT"]`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					objPrivs(db, "ACC_SWS_ROLE", "ACC_SWS_S2", ""),
+					objPrivs(db, "ACC_SWS_ROLE", "ACC_SWS_S", "SELECT"),
+				),
+			},
+		},
+	})
+}
+
 func TestAccObjectPrivilege_OnSchema(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
