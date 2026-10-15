@@ -3,6 +3,7 @@ package resources
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"terraform-provider-exasol/internal/exasolclient"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -127,6 +129,7 @@ func (r *ObjectPrivilegeResource) Create(ctx context.Context, req resource.Creat
 
 	plan.ID = types.StringValue(objectPrivilegeID(plan))
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+	resp.Diagnostics.Append(storeObjectTarget(ctx, resp.Private, unquotedName(plan.ObjectName.ValueString()))...)
 }
 
 func (r *ObjectPrivilegeResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -143,10 +146,14 @@ func (r *ObjectPrivilegeResource) Read(ctx context.Context, req resource.ReadReq
 
 	grantee := strings.ToUpper(state.Grantee.ValueString())
 	objectType := strings.ToUpper(state.ObjectType.ValueString())
-	objectName, _, err := objectTarget(ctx, r.db, state.ObjectName.ValueString())
-	if err != nil {
-		resp.Diagnostics.AddError("Check object failed", err.Error())
-		return
+	objectName, known := knownObjectTarget(ctx, req.Private)
+	if !known {
+		var err error
+		objectName, _, err = objectTarget(ctx, r.db, state.ObjectName.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddError("Check object failed", err.Error())
+			return
+		}
 	}
 
 	// Extract privileges from list
@@ -185,6 +192,7 @@ func (r *ObjectPrivilegeResource) Read(ctx context.Context, req resource.ReadReq
 	state.Privileges = privList
 	state.ID = types.StringValue(objectPrivilegeID(state))
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+	resp.Diagnostics.Append(storeObjectTarget(ctx, resp.Private, objectName)...)
 }
 
 func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
@@ -216,33 +224,45 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 	newGrantee := strings.ToUpper(plan.Grantee.ValueString())
 	oldObjectType := strings.ToUpper(state.ObjectType.ValueString())
 	newObjectType := strings.ToUpper(plan.ObjectType.ValueString())
-	oldObjectName := qualify(state.ObjectName.ValueString())
-	newObjectName := qualify(plan.ObjectName.ValueString())
+	// The old target is the known one from private state (see Read). The new
+	// one is the configured spelling resolved like an unknown target, so a
+	// lowercase spelling of an uppercase object (e.g. after an import) is the
+	// same object, and GRANT below goes where the lookups go.
+	oldTarget, known := knownObjectTarget(ctx, req.Private)
+	if !known {
+		var err error
+		oldTarget, _, err = objectTarget(ctx, r.db, state.ObjectName.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddError("Check object failed", err.Error())
+			return
+		}
+	}
+	newTarget, _, err := objectTarget(ctx, r.db, plan.ObjectName.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Check object failed", err.Error())
+		return
+	}
+	newObjectName := qualify(newTarget)
 
-	// If grantee, object type, or object name changed, revoke all old and grant
-	// all new. A grantee or schema renamed away in this run counts as changed
-	// even if the configured name is the same.
-	if oldGrantee != newGrantee || oldObjectType != newObjectType || oldObjectName != newObjectName ||
+	// If grantee, object type, or target object changed, revoke all old and
+	// grant all new. A grantee or schema renamed away in this run counts as
+	// changed even if the configured name is the same.
+	if oldGrantee != newGrantee || oldObjectType != newObjectType || oldTarget != newTarget ||
 		renamedAway(r.renames, exasolclient.RenamePrincipal, oldGrantee, newGrantee) ||
-		objectRenamedAway(r.renames, state.ObjectName.ValueString(), plan.ObjectName.ValueString()) {
+		objectRenamedAway(r.renames, oldTarget, newTarget) {
 		// Find where the previous privileges live now: Exasol moves them to
 		// the new name when the grantee or schema is renamed. Revoke every
 		// previous privilege there that this resource does not keep. A dropped
 		// grantee or object took its privileges with it. Lookup and REVOKE use
 		// the same target name (see objectTarget), so the REVOKE always hits the
 		// object the lookup found.
-		newLookupName, _, err := objectTarget(ctx, r.db, plan.ObjectName.ValueString())
-		if err != nil {
-			resp.Diagnostics.AddError("Check object failed", err.Error())
-			return
-		}
+		newLookupName := newTarget
 		curGrantee, granteeGone, err := resolveEndpoint(ctx, r.db, r.renames, exasolclient.RenamePrincipal, oldGrantee, newGrantee, principalExists)
 		if err != nil {
 			resp.Diagnostics.AddError("Check grantee failed", err.Error())
 			return
 		}
-		curObject, objectGone, err := resolveObject(ctx, r.db, r.renames,
-			state.ObjectName.ValueString(), plan.ObjectName.ValueString())
+		curObject, objectGone, err := resolveKnownObject(ctx, r.db, r.renames, oldTarget)
 		if err != nil {
 			resp.Diagnostics.AddError("Check object failed", err.Error())
 			return
@@ -313,12 +333,9 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 		}
 
 		// Revoke privileges that are no longer in the list. Lookup and REVOKE
-		// use the same target name, as in the other branches.
-		lookupName, _, err := objectTarget(ctx, r.db, plan.ObjectName.ValueString())
-		if err != nil {
-			resp.Diagnostics.AddError("Check object failed", err.Error())
-			return
-		}
+		// use the known target, as in the other branches; it equals newTarget
+		// here (otherwise the branch above runs).
+		lookupName := oldTarget
 		for priv := range oldPrivSet {
 			if newPrivSet[priv] {
 				continue
@@ -354,6 +371,7 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 
 	plan.ID = types.StringValue(objectPrivilegeID(plan))
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+	resp.Diagnostics.Append(storeObjectTarget(ctx, resp.Private, newTarget)...)
 }
 
 func (r *ObjectPrivilegeResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -378,9 +396,22 @@ func (r *ObjectPrivilegeResource) Delete(ctx context.Context, req resource.Delet
 	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, grantee); ok {
 		grantee = current
 	}
-	lookupName, _, err := resolveObject(ctx, r.db, r.renames, state.ObjectName.ValueString(), state.ObjectName.ValueString())
+	oldTarget, known := knownObjectTarget(ctx, req.Private)
+	if !known {
+		var err error
+		oldTarget, _, err = objectTarget(ctx, r.db, state.ObjectName.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddError("Check object failed", err.Error())
+			return
+		}
+	}
+	lookupName, gone, err := resolveKnownObject(ctx, r.db, r.renames, oldTarget)
 	if err != nil {
 		resp.Diagnostics.AddError("Check object failed", err.Error())
+		return
+	}
+	if gone {
+		// The object was dropped and its privileges with it.
 		return
 	}
 	objectName := qualify(lookupName)
@@ -508,3 +539,48 @@ func checkObjectPrivilegeExists(ctx context.Context, db *sql.DB, grantee, privil
 	}
 	return true, nil
 }
+
+// objectTargetKey stores the exact object a privilege was granted on (SCHEMA or
+// SCHEMA.NAME, case as in Exasol, no quotes) in private state. object_name keeps
+// the configured spelling, which can differ in case (e.g. after an import).
+const objectTargetKey = "object_target"
+
+type privateGetter interface {
+	GetKey(ctx context.Context, key string) ([]byte, diag.Diagnostics)
+}
+
+type privateSetter interface {
+	SetKey(ctx context.Context, key string, value []byte) diag.Diagnostics
+}
+
+// knownObjectTarget returns the stored exact target, if any.
+func knownObjectTarget(ctx context.Context, p privateGetter) (string, bool) {
+	if p == nil {
+		return "", false
+	}
+	raw, diags := p.GetKey(ctx, objectTargetKey)
+	if diags.HasError() || len(raw) == 0 {
+		return "", false
+	}
+	var target string
+	if err := json.Unmarshal(raw, &target); err != nil || target == "" {
+		return "", false
+	}
+	return target, true
+}
+
+func storeObjectTarget(ctx context.Context, p privateSetter, target string) diag.Diagnostics {
+	if p == nil {
+		return nil
+	}
+	raw, err := json.Marshal(target)
+	if err != nil {
+		var diags diag.Diagnostics
+		diags.AddError("Store object target failed", err.Error())
+		return diags
+	}
+	return p.SetKey(ctx, objectTargetKey, raw)
+}
+
+// unquotedName is the configured object name as qualify() targets it.
+func unquotedName(name string) string { return strings.ReplaceAll(name, `"`, "") }

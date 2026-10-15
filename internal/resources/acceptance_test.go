@@ -1997,6 +1997,139 @@ resource "exasol_schema" "s" {
 	})
 }
 
+// objPrivs returns a check that the privileges of role on schema (exact name)
+// are want, comma-separated and sorted.
+func objPrivs(db *sql.DB, role, schema, want string) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		// Exasol treats '' as NULL, so no rows yield NULL here
+		var got sql.NullString
+		if err := db.QueryRow(`SELECT GROUP_CONCAT(PRIVILEGE ORDER BY PRIVILEGE) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ? AND OBJECT_NAME = ? AND OBJECT_TYPE = 'SCHEMA'`, role, schema).Scan(&got); err != nil {
+			return err
+		}
+		if got.String != want {
+			return fmt.Errorf("privileges of %s on %s: got %q, want %q", role, schema, got.String, want)
+		}
+		return nil
+	}
+}
+
+// Twin schemas "acc_tdr_s" and "ACC_TDR_S" have identical grants. When the
+// lowercase twin is dropped outside Terraform, refresh must not switch its
+// grant resource over to the uppercase twin, and removing that resource must
+// not revoke the uppercase twin's grant.
+func TestAccObjectPrivilege_DroppedTwinKeepsOtherTwin(t *testing.T) {
+	db := testAccDB(t)
+	grant := func(res, schema string) string {
+		return fmt.Sprintf(`
+resource "exasol_object_privilege" %q {
+  grantee     = exasol_role.r.name
+  privileges  = ["SELECT", "INSERT"]
+  object_type = "SCHEMA"
+  object_name = %q
+}`, res, schema)
+	}
+	role := providerConfig() + `
+resource "exasol_role" "r" {
+  name = "ACC_TDR_ROLE"
+}`
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			for _, stmt := range []string{`CREATE SCHEMA IF NOT EXISTS "acc_tdr_s"`, `CREATE SCHEMA IF NOT EXISTS "ACC_TDR_S"`} {
+				if _, err := db.Exec(stmt); err != nil {
+					t.Fatalf("setup %q: %v", stmt, err)
+				}
+			}
+			t.Cleanup(func() {
+				_, _ = db.Exec(`DROP SCHEMA IF EXISTS "acc_tdr_s" CASCADE`)
+				_, _ = db.Exec(`DROP SCHEMA IF EXISTS "ACC_TDR_S" CASCADE`)
+				db.Close()
+			})
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: role + grant("low", "acc_tdr_s") + grant("up", "ACC_TDR_S"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					objPrivs(db, "ACC_TDR_ROLE", "acc_tdr_s", "INSERT,SELECT"),
+					objPrivs(db, "ACC_TDR_ROLE", "ACC_TDR_S", "INSERT,SELECT"),
+				),
+			},
+			// Drop the lowercase twin outside Terraform and remove its resource
+			{
+				PreConfig: func() {
+					if _, err := db.Exec(`DROP SCHEMA "acc_tdr_s" CASCADE`); err != nil {
+						t.Fatalf("drop outside Terraform: %v", err)
+					}
+				},
+				Config: role + grant("up", "ACC_TDR_S"),
+				Check:  objPrivs(db, "ACC_TDR_ROLE", "ACC_TDR_S", "INSERT,SELECT"),
+			},
+		},
+	})
+}
+
+// A grant imported with a lowercase spelling of an uppercase schema follows
+// a rename of that schema in the same apply as a privilege change.
+func TestAccObjectPrivilege_ImportedSpellingThenSchemaRename(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(schema, privs string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "s" {
+  name = %q
+}
+resource "exasol_role" "r" {
+  name = "ACC_ISR_ROLE"
+}
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "SCHEMA"
+  object_name = exasol_schema.s.name
+}`, schema, privs)
+	}
+	base := providerConfig() + `
+resource "exasol_schema" "s" {
+  name = "ACC_ISR_OLD"
+}
+resource "exasol_role" "r" {
+  name = "ACC_ISR_ROLE"
+}`
+	both := `["SELECT", "INSERT"]`
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{Config: base},
+			{
+				PreConfig: func() {
+					for _, stmt := range []string{
+						`GRANT SELECT ON SCHEMA ACC_ISR_OLD TO ACC_ISR_ROLE`,
+						`GRANT INSERT ON SCHEMA ACC_ISR_OLD TO ACC_ISR_ROLE`,
+					} {
+						if _, err := db.Exec(stmt); err != nil {
+							t.Fatalf("grant outside Terraform %q: %v", stmt, err)
+						}
+					}
+				},
+				Config:             config("ACC_ISR_OLD", both),
+				ResourceName:       "exasol_object_privilege.o",
+				ImportState:        true,
+				ImportStateId:      "ACC_ISR_ROLE|SELECT,INSERT|SCHEMA|acc_isr_old",
+				ImportStatePersist: true,
+			},
+			// Rename the schema and drop INSERT in the same apply
+			{
+				Config: config("ACC_ISR_NEW", `["SELECT"]`),
+				Check:  objPrivs(db, "ACC_ISR_ROLE", "ACC_ISR_NEW", "SELECT"),
+			},
+		},
+	})
+}
+
 func TestAccObjectPrivilege_OnSchema(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },

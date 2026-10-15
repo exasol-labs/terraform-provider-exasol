@@ -90,12 +90,15 @@ func objectRenamedAway(renames *exasolclient.RenameLog, oldName, newName string)
 	return renamedAway(renames, exasolclient.RenameSchema, oldSchema, newSchema)
 }
 
-// objectTarget returns the name to look up and revoke for an object privilege
-// target, and whether that object exists. Quoted names are case-sensitive in
-// Exasol and exasol_schema keeps the configured case, so "s" and "S" can both
-// exist: the exact spelling wins. Only when no object has the exact spelling
-// is the uppercase one used, e.g. for a lowercase spelling of an uppercase
-// object in an import. Quotes are ignored, as in qualify().
+// objectTarget resolves the target of an object privilege whose exact target is
+// not known yet (an import, or state written by provider 0.2.x), and reports
+// whether that object exists. Quoted names are case-sensitive in Exasol and
+// exasol_schema keeps the configured case, so "s" and "S" can both exist: the
+// exact spelling wins. Only when no object has the exact spelling is the
+// uppercase one used, e.g. for a lowercase spelling of an uppercase object in
+// an import. Quotes are ignored, as in qualify(). The result is stored in
+// private state, so later operations use the known target, see
+// knownObjectTarget.
 func objectTarget(ctx context.Context, db *sql.DB, name string) (string, bool, error) {
 	exact := strings.ReplaceAll(name, `"`, "")
 	found, err := objectExists(ctx, db, exact)
@@ -110,28 +113,24 @@ func objectTarget(ctx context.Context, db *sql.DB, name string) (string, bool, e
 	return upper, found, err
 }
 
-// resolveObject does the same for an object privilege target: a schema name,
-// or SCHEMA.NAME whose schema may have been renamed. It returns the target as
-// objectTarget does.
-func resolveObject(ctx context.Context, db *sql.DB, renames *exasolclient.RenameLog, oldName, newName string) (string, bool, error) {
-	oldName = strings.ReplaceAll(oldName, `"`, "")
-	newName = strings.ReplaceAll(newName, `"`, "")
-	schema, object, qualified := strings.Cut(oldName, ".")
+// resolveKnownObject returns where an object privilege target that was known
+// exactly as oldTarget (SCHEMA or SCHEMA.NAME, case as stored, no quotes) lives
+// now, or gone=true if it no longer exists. A schema renamed in this run comes
+// from the rename log. There is no case fallback: a known target that
+// disappeared was dropped.
+func resolveKnownObject(ctx context.Context, db *sql.DB, renames *exasolclient.RenameLog, oldTarget string) (string, bool, error) {
+	schema, object, qualified := strings.Cut(oldTarget, ".")
 	if current, ok := renames.Lookup(exasolclient.RenameSchema, schema); ok {
 		if qualified {
 			current += "." + object
 		}
-		target, _, err := objectTarget(ctx, db, current)
-		return target, false, err
+		return current, false, nil
 	}
-	target, found, err := objectTarget(ctx, db, oldName)
+	found, err := objectExists(ctx, db, oldTarget)
 	if err != nil {
 		return "", false, err
 	}
-	if oldName == newName || found {
-		return target, false, nil
-	}
-	return "", true, nil
+	return oldTarget, !found, nil
 }
 
 func rowExists(ctx context.Context, db *sql.DB, query string, args ...any) (bool, error) {
