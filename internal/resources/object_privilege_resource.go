@@ -304,14 +304,26 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 			newPrivSet[strings.ToUpper(p)] = true
 		}
 
-		// Revoke privileges that are no longer in the list
+		// Revoke privileges that are no longer in the list. Lookup and REVOKE
+		// use the same uppercase name, as in the other branches.
+		lookupName := strings.ToUpper(plan.ObjectName.ValueString())
 		for priv := range oldPrivSet {
-			if !newPrivSet[priv] {
-				revokeStmt := fmt.Sprintf(`REVOKE %s ON %s %s FROM "%s"`, priv, newObjectType, newObjectName, newGrantee)
-				tflog.Info(ctx, "Revoking removed privilege", map[string]any{"sql": revokeStmt})
-				if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
-					tflog.Warn(ctx, "REVOKE failed (privilege may not exist)", map[string]any{"error": err.Error()})
-				}
+			if newPrivSet[priv] {
+				continue
+			}
+			exists, err := checkObjectPrivilegeExists(ctx, r.db, newGrantee, priv, newObjectType, lookupName)
+			if err != nil {
+				resp.Diagnostics.AddError("Check object privilege failed", err.Error())
+				return
+			}
+			if !exists {
+				continue
+			}
+			revokeStmt := fmt.Sprintf(`REVOKE %s ON %s %s FROM "%s"`, priv, newObjectType, qualify(lookupName), newGrantee)
+			tflog.Info(ctx, "Revoking removed privilege", map[string]any{"sql": revokeStmt})
+			if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+				resp.Diagnostics.AddError(fmt.Sprintf("REVOKE %s failed", priv), err.Error())
+				return
 			}
 		}
 

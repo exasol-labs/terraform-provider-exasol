@@ -1793,6 +1793,74 @@ resource "exasol_object_privilege" "o" {
 	})
 }
 
+// Same, for the branch where only the privilege list changes: state and
+// configuration both keep the lowercase name, and the removed privilege must
+// really be revoked.
+func TestAccObjectPrivilege_LowercaseNamePrivilegeRemoval(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	base := providerConfig() + `
+resource "exasol_schema" "s" {
+  name = "ACC_LCR_SCHEMA"
+}
+resource "exasol_role" "r" {
+  name = "ACC_LCR_ROLE"
+}`
+	grant := func(privs string) string {
+		return fmt.Sprintf(`
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "SCHEMA"
+  object_name = "acc_lcr_schema"
+  depends_on  = [exasol_schema.s]
+}`, privs)
+	}
+	privs := func(want string) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			var got string
+			if err := db.QueryRow(`SELECT COALESCE(GROUP_CONCAT(PRIVILEGE ORDER BY PRIVILEGE), '') FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_LCR_ROLE'`).Scan(&got); err != nil {
+				return err
+			}
+			if got != want {
+				return fmt.Errorf("object privileges of ACC_LCR_ROLE: got %q, want %q", got, want)
+			}
+			return nil
+		}
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckObjectPrivilegeDestroy,
+		Steps: []resource.TestStep{
+			{Config: base},
+			// Grant outside Terraform, import with a lowercase object name
+			{
+				PreConfig: func() {
+					for _, stmt := range []string{
+						`GRANT SELECT ON SCHEMA ACC_LCR_SCHEMA TO ACC_LCR_ROLE`,
+						`GRANT INSERT ON SCHEMA ACC_LCR_SCHEMA TO ACC_LCR_ROLE`,
+					} {
+						if _, err := db.Exec(stmt); err != nil {
+							t.Fatalf("grant outside Terraform %q: %v", stmt, err)
+						}
+					}
+				},
+				Config:             base + grant(`["SELECT", "INSERT"]`),
+				ResourceName:       "exasol_object_privilege.o",
+				ImportState:        true,
+				ImportStateId:      "ACC_LCR_ROLE|SELECT,INSERT|SCHEMA|acc_lcr_schema",
+				ImportStatePersist: true,
+			},
+			// Remove INSERT; the name stays lowercase in state and config
+			{
+				Config: base + grant(`["SELECT"]`),
+				Check:  privs("SELECT"),
+			},
+		},
+	})
+}
+
 func TestAccObjectPrivilege_OnSchema(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
