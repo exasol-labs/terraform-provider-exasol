@@ -173,9 +173,13 @@ func (r *RoleGrantResource) Update(ctx context.Context, req resource.UpdateReque
 		return
 	}
 
-	// If role or grantee changed, need to revoke old and grant new
+	// If role or grantee changed, need to revoke old and grant new. A role or
+	// grantee renamed away in this run counts as changed even if the
+	// configured name is the same.
 	if plan.Role.ValueString() != state.Role.ValueString() ||
-		plan.Grantee.ValueString() != state.Grantee.ValueString() {
+		plan.Grantee.ValueString() != state.Grantee.ValueString() ||
+		renamedAway(r.renames, exasolclient.RenamePrincipal, state.Role.ValueString(), plan.Role.ValueString()) ||
+		renamedAway(r.renames, exasolclient.RenamePrincipal, state.Grantee.ValueString(), plan.Grantee.ValueString()) {
 
 		oldRole := strings.ToUpper(state.Role.ValueString())
 		oldGrantee := strings.ToUpper(state.Grantee.ValueString())

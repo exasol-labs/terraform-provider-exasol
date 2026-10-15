@@ -1028,6 +1028,91 @@ resource "exasol_system_privilege" "p_reuse" {
 	})
 }
 
+// Name swap in one apply: user a is renamed A to C, then user b B to A, and
+// the grants move from a to b (whose name is now A, the same string as before)
+// while their options change. The grants on C must be revoked. Grants with no
+// other attribute (connection, impersonation) get no plan diff in this case,
+// so Terraform never updates them: a documented limit.
+func TestAccRename_NameSwapSameConfiguredName(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(aName, bName, holder, admin, privs string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_user" "a" {
+  name      = %[1]q
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_user" "b" {
+  name       = %[2]q
+  auth_type  = "PASSWORD"
+  password   = "TestPass123"
+  depends_on = [exasol_user.a]
+}
+resource "exasol_role" "r" {
+  name = "ACC_SWAP_ROLE"
+}
+resource "exasol_schema" "s" {
+  name = "ACC_SWAP_SCHEMA"
+}
+resource "exasol_system_privilege" "p" {
+  grantee           = exasol_user.%[3]s.name
+  privilege         = "CREATE TABLE"
+  with_admin_option = %[4]s
+}
+resource "exasol_role_grant" "g" {
+  role              = exasol_role.r.name
+  grantee           = exasol_user.%[3]s.name
+  with_admin_option = %[4]s
+}
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_user.%[3]s.name
+  privileges  = %[5]s
+  object_type = "SCHEMA"
+  object_name = exasol_schema.s.name
+}`, aName, bName, holder, admin, privs)
+	}
+	grants := func(user, want string) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			var got string
+			err := db.QueryRow(`SELECT
+  (SELECT COALESCE(GROUP_CONCAT(PRIVILEGE || ':' || ADMIN_OPTION ORDER BY PRIVILEGE), '') FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE = ?) || '|' ||
+  (SELECT COALESCE(GROUP_CONCAT(GRANTED_ROLE || ':' || ADMIN_OPTION ORDER BY GRANTED_ROLE), '') FROM EXA_DBA_ROLE_PRIVS WHERE GRANTEE = ?) || '|' ||
+  (SELECT COALESCE(GROUP_CONCAT(PRIVILEGE ORDER BY PRIVILEGE), '') FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ?)`,
+				user, user, user).Scan(&got)
+			if err != nil {
+				return err
+			}
+			got = strings.NewReplacer(":TRUE", ":true", ":FALSE", ":false", ":1", ":true", ":0", ":false").Replace(got)
+			if got != want {
+				return fmt.Errorf("grants of %s: got %q, want %q", user, got, want)
+			}
+			return nil
+		}
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckUserDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("ACC_SWAP_A", "ACC_SWAP_B", "a", "null", `["SELECT", "INSERT"]`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					grants("ACC_SWAP_A", "CREATE TABLE:false|ACC_SWAP_ROLE:false|INSERT,SELECT"),
+					grants("ACC_SWAP_B", "||"),
+				),
+			},
+			{
+				Config: config("ACC_SWAP_C", "ACC_SWAP_A", "b", "true", `["SELECT"]`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					grants("ACC_SWAP_C", "||"),
+					grants("ACC_SWAP_A", "CREATE TABLE:true|ACC_SWAP_ROLE:true|SELECT"),
+				),
+			},
+		},
+	})
+}
+
 // testAccCheckUserLogin checks the user's direct CREATE SESSION grant and
 // whether a login with the given password succeeds.
 func testAccCheckUserLogin(user, password string, wantLogin bool) resource.TestCheckFunc {

@@ -215,8 +215,12 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 	oldObjectName := qualify(state.ObjectName.ValueString())
 	newObjectName := qualify(plan.ObjectName.ValueString())
 
-	// If grantee, object type, or object name changed, revoke all old and grant all new
-	if oldGrantee != newGrantee || oldObjectType != newObjectType || oldObjectName != newObjectName {
+	// If grantee, object type, or object name changed, revoke all old and grant
+	// all new. A grantee or schema renamed away in this run counts as changed
+	// even if the configured name is the same.
+	if oldGrantee != newGrantee || oldObjectType != newObjectType || oldObjectName != newObjectName ||
+		renamedAway(r.renames, exasolclient.RenamePrincipal, oldGrantee, newGrantee) ||
+		objectRenamedAway(r.renames, state.ObjectName.ValueString(), plan.ObjectName.ValueString()) {
 		// Find where the previous privileges live now: Exasol moves them to
 		// the new name when the grantee or schema is renamed. Revoke every
 		// previous privilege there that this resource does not keep. A dropped

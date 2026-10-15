@@ -170,9 +170,12 @@ func (r *SystemPrivilegeResource) Update(ctx context.Context, req resource.Updat
 		return
 	}
 
-	// If grantee or privilege changed, need to revoke old and grant new
+	// If grantee or privilege changed, need to revoke old and grant new. A
+	// grantee renamed away in this run counts as changed even if the
+	// configured name is the same.
 	if plan.Grantee.ValueString() != state.Grantee.ValueString() ||
-		plan.Privilege.ValueString() != state.Privilege.ValueString() {
+		plan.Privilege.ValueString() != state.Privilege.ValueString() ||
+		renamedAway(r.renames, exasolclient.RenamePrincipal, state.Grantee.ValueString(), plan.Grantee.ValueString()) {
 
 		oldGrantee := strings.ToUpper(state.Grantee.ValueString())
 		oldPrivilege := strings.ToUpper(state.Privilege.ValueString())

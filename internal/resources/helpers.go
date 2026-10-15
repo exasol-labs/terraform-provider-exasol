@@ -66,6 +66,22 @@ func resolveEndpoint(ctx context.Context, db *sql.DB, renames *exasolclient.Rena
 	return oldName, false, nil
 }
 
+// renamedAway reports whether the object that oldName named in state was renamed
+// in this run to a name other than newName. That happens when another object
+// takes over the old name in the same apply (rename A to C, then B to A): the
+// configured name is unchanged, but the grant has to be reconciled as moved.
+func renamedAway(renames *exasolclient.RenameLog, kind, oldName, newName string) bool {
+	current, ok := renames.Lookup(kind, oldName)
+	return ok && current != strings.ToUpper(newName)
+}
+
+// objectRenamedAway does the same for the schema of an object privilege target.
+func objectRenamedAway(renames *exasolclient.RenameLog, oldName, newName string) bool {
+	oldSchema, _, _ := strings.Cut(strings.ToUpper(strings.ReplaceAll(oldName, `"`, "")), ".")
+	newSchema, _, _ := strings.Cut(strings.ToUpper(strings.ReplaceAll(newName, `"`, "")), ".")
+	return renamedAway(renames, exasolclient.RenameSchema, oldSchema, newSchema)
+}
+
 // resolveObject does the same for an object privilege target: a schema name, or
 // SCHEMA.NAME whose schema may have been renamed. Names are uppercase; quotes
 // are removed, as in qualify().
