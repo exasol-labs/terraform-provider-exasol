@@ -210,8 +210,19 @@ func testAccCheckObjectPrivilegeDestroy(s *terraform.State) error {
 		if len(parts) < 4 {
 			continue
 		}
+		// SCHEMA.TABLE is stored as OBJECT_SCHEMA + OBJECT_NAME
+		schema, name := "", parts[3]
+		if i := strings.Index(name, "."); i >= 0 {
+			schema, name = name[:i], name[i+1:]
+		}
+		query := `SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ? AND OBJECT_TYPE = ? AND OBJECT_NAME = ?`
+		args := []any{parts[0], parts[2], name}
+		if schema != "" {
+			query += ` AND OBJECT_SCHEMA = ?`
+			args = append(args, schema)
+		}
 		var count int
-		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ? AND OBJECT_TYPE = ? AND OBJECT_NAME = ?`, parts[0], parts[2], parts[3]).Scan(&count); err != nil {
+		if err := db.QueryRow(query, args...).Scan(&count); err != nil {
 			return err
 		}
 		if count > 0 {
@@ -851,6 +862,66 @@ resource "exasol_role_grant" "test" {
 }
 
 // --- Object Privilege: grant, add privilege ---
+
+// Table grants are stored with OBJECT_SCHEMA and OBJECT_NAME split in
+// EXA_DBA_OBJ_PRIVS. Read must find them (no drift) and Delete must revoke them.
+func TestAccObjectPrivilege_OnTable(t *testing.T) {
+	db := testAccDB(t)
+	role := `
+resource "exasol_role" "test" {
+  name = "ACC_OBJTBL_ROLE"
+}`
+	grant := `
+resource "exasol_object_privilege" "test" {
+  grantee     = exasol_role.test.name
+  privileges  = ["SELECT"]
+  object_type = "TABLE"
+  object_name = "ACC_OBJTBL_SCHEMA.T1"
+}`
+	tablePrivs := func(want int) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			var n int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_OBJTBL_ROLE' AND OBJECT_SCHEMA = 'ACC_OBJTBL_SCHEMA' AND OBJECT_NAME = 'T1'`).Scan(&n); err != nil {
+				return err
+			}
+			if n != want {
+				return fmt.Errorf("table privileges for ACC_OBJTBL_ROLE: got %d, want %d", n, want)
+			}
+			return nil
+		}
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			for _, stmt := range []string{
+				`CREATE SCHEMA IF NOT EXISTS ACC_OBJTBL_SCHEMA`,
+				`CREATE OR REPLACE TABLE ACC_OBJTBL_SCHEMA.T1 (A INT)`,
+			} {
+				if _, err := db.Exec(stmt); err != nil {
+					t.Fatalf("setup %q: %v", stmt, err)
+				}
+			}
+			t.Cleanup(func() {
+				_, _ = db.Exec(`DROP SCHEMA IF EXISTS ACC_OBJTBL_SCHEMA CASCADE`)
+				db.Close()
+			})
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckObjectPrivilegeDestroy,
+		Steps: []resource.TestStep{
+			// Grant on a table; the post-apply plan must be empty (no drift)
+			{
+				Config: providerConfig() + role + grant,
+				Check:  tablePrivs(1),
+			},
+			// Remove the grant only: Delete must revoke it
+			{
+				Config: providerConfig() + role,
+				Check:  tablePrivs(0),
+			},
+		},
+	})
+}
 
 func TestAccObjectPrivilege_OnSchema(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{

@@ -380,12 +380,23 @@ func checkObjectPrivilegeExists(ctx context.Context, db *sql.DB, grantee, privil
 		"object_name": objectName,
 	})
 
+	// EXA_DBA_OBJ_PRIVS stores SCHEMA.TABLE as OBJECT_SCHEMA + OBJECT_NAME, and a
+	// schema as OBJECT_NAME with an empty OBJECT_SCHEMA.
+	where := `GRANTEE = ? AND OBJECT_TYPE = ? AND OBJECT_NAME = ?`
+	args := []any{grantee, objectType}
+	unquoted := strings.ReplaceAll(objectName, `"`, "")
+	if schema, name, qualified := strings.Cut(unquoted, "."); qualified {
+		where += ` AND OBJECT_SCHEMA = ?`
+		args = append(args, name, schema)
+	} else {
+		args = append(args, unquoted)
+	}
+
 	// Special handling for "ALL" privilege
 	if privilege == "ALL" {
 		// First, try to find "ALL" privilege directly
-		query := `SELECT 1 FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ? AND PRIVILEGE = 'ALL' AND OBJECT_TYPE = ? AND OBJECT_NAME = ?`
 		var dummy int
-		err := db.QueryRowContext(ctx, query, grantee, objectType, objectName).Scan(&dummy)
+		err := db.QueryRowContext(ctx, `SELECT 1 FROM EXA_DBA_OBJ_PRIVS WHERE PRIVILEGE = 'ALL' AND `+where, args...).Scan(&dummy)
 		if err == nil {
 			tflog.Debug(ctx, "Object privilege 'ALL' found in EXA_DBA_OBJ_PRIVS")
 			return true, nil
@@ -395,10 +406,8 @@ func checkObjectPrivilegeExists(ctx context.Context, db *sql.DB, grantee, privil
 		}
 
 		// If "ALL" is not found directly, check if any individual privileges exist
-		countQuery := `SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ? AND OBJECT_TYPE = ? AND OBJECT_NAME = ?`
 		var count int
-		err = db.QueryRowContext(ctx, countQuery, grantee, objectType, objectName).Scan(&count)
-		if err != nil {
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE `+where, args...).Scan(&count); err != nil {
 			return false, err
 		}
 		if count > 0 {
@@ -409,9 +418,8 @@ func checkObjectPrivilegeExists(ctx context.Context, db *sql.DB, grantee, privil
 	}
 
 	// For non-ALL privileges, query directly
-	query := `SELECT 1 FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ? AND PRIVILEGE = ? AND OBJECT_TYPE = ? AND OBJECT_NAME = ?`
 	var dummy int
-	err := db.QueryRowContext(ctx, query, grantee, privilege, objectType, objectName).Scan(&dummy)
+	err := db.QueryRowContext(ctx, `SELECT 1 FROM EXA_DBA_OBJ_PRIVS WHERE PRIVILEGE = ? AND `+where, append([]any{privilege}, args...)...).Scan(&dummy)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}

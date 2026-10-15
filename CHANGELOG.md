@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - Renaming a user or role no longer fails in `exasol_system_privilege`, `exasol_role_grant`, `exasol_object_privilege`, `exasol_connection_grant`, `exasol_user_impersonation_grant` and `exasol_role_impersonation_grant`. Exasol moves grants to the new name itself; these resources now revoke a grant only if it still exists and skip the grant if it already exists. `Delete` also no longer fails when the grant is already gone
+- `exasol_object_privilege` on a table or view (`object_name = "SCHEMA.TABLE"`) is found again on refresh. Exasol stores the schema and the object name in separate columns, so the lookup never matched: every plan wanted to create the grant again. Schema grants were not affected
 
 ## [0.2.5] - 2026-09-16
 
