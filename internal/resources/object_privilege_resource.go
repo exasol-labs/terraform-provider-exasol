@@ -143,7 +143,11 @@ func (r *ObjectPrivilegeResource) Read(ctx context.Context, req resource.ReadReq
 
 	grantee := strings.ToUpper(state.Grantee.ValueString())
 	objectType := strings.ToUpper(state.ObjectType.ValueString())
-	objectName := strings.ToUpper(state.ObjectName.ValueString())
+	objectName, _, err := objectTarget(ctx, r.db, state.ObjectName.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Check object failed", err.Error())
+		return
+	}
 
 	// Extract privileges from list
 	var privileges []string
@@ -225,23 +229,27 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 		// the new name when the grantee or schema is renamed. Revoke every
 		// previous privilege there that this resource does not keep. A dropped
 		// grantee or object took its privileges with it. Lookup and REVOKE use
-		// the same uppercase name, so a lowercase name in state cannot make the
-		// REVOKE target a different object than the lookup found.
-		newLookupName := strings.ToUpper(plan.ObjectName.ValueString())
+		// the same target name (see objectTarget), so the REVOKE always hits the
+		// object the lookup found.
+		newLookupName, _, err := objectTarget(ctx, r.db, plan.ObjectName.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddError("Check object failed", err.Error())
+			return
+		}
 		curGrantee, granteeGone, err := resolveEndpoint(ctx, r.db, r.renames, exasolclient.RenamePrincipal, oldGrantee, newGrantee, principalExists)
 		if err != nil {
 			resp.Diagnostics.AddError("Check grantee failed", err.Error())
 			return
 		}
 		curObject, objectGone, err := resolveObject(ctx, r.db, r.renames,
-			strings.ToUpper(state.ObjectName.ValueString()), newLookupName)
+			state.ObjectName.ValueString(), plan.ObjectName.ValueString())
 		if err != nil {
 			resp.Diagnostics.AddError("Check object failed", err.Error())
 			return
 		}
 		if !granteeGone && !objectGone {
 			sameLocation := curGrantee == newGrantee && oldObjectType == newObjectType &&
-				curObject == strings.ReplaceAll(newLookupName, `"`, "")
+				curObject == newLookupName
 			keep := make(map[string]bool)
 			if sameLocation {
 				for _, p := range newPrivileges {
@@ -277,7 +285,7 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 		for _, privilege := range newPrivileges {
 			priv := strings.ToUpper(privilege)
 			if priv != "ALL" {
-				exists, err := checkObjectPrivilegeExists(ctx, r.db, newGrantee, priv, newObjectType, strings.ToUpper(plan.ObjectName.ValueString()))
+				exists, err := checkObjectPrivilegeExists(ctx, r.db, newGrantee, priv, newObjectType, newLookupName)
 				if err != nil {
 					resp.Diagnostics.AddError("Check object privilege failed", err.Error())
 					return
@@ -305,8 +313,12 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 		}
 
 		// Revoke privileges that are no longer in the list. Lookup and REVOKE
-		// use the same uppercase name, as in the other branches.
-		lookupName := strings.ToUpper(plan.ObjectName.ValueString())
+		// use the same target name, as in the other branches.
+		lookupName, _, err := objectTarget(ctx, r.db, plan.ObjectName.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddError("Check object failed", err.Error())
+			return
+		}
 		for priv := range oldPrivSet {
 			if newPrivSet[priv] {
 				continue
@@ -361,12 +373,12 @@ func (r *ObjectPrivilegeResource) Delete(ctx context.Context, req resource.Delet
 
 	grantee := strings.ToUpper(state.Grantee.ValueString())
 	objectType := strings.ToUpper(state.ObjectType.ValueString())
-	// Lookup and REVOKE both use the uppercase name, see Update. A grantee or
-	// schema renamed in this run carries the privileges to its new name.
+	// Lookup and REVOKE use the same target name, see objectTarget. A grantee
+	// or schema renamed in this run carries the privileges to its new name.
 	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, grantee); ok {
 		grantee = current
 	}
-	lookupName, _, err := resolveObject(ctx, r.db, r.renames, strings.ToUpper(state.ObjectName.ValueString()), strings.ToUpper(state.ObjectName.ValueString()))
+	lookupName, _, err := resolveObject(ctx, r.db, r.renames, state.ObjectName.ValueString(), state.ObjectName.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Check object failed", err.Error())
 		return

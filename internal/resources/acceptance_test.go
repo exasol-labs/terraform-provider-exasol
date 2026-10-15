@@ -1861,6 +1861,82 @@ resource "exasol_object_privilege" "o" {
 	})
 }
 
+// Grants on case twins "acc_ctw_schema" and "ACC_CTW_SCHEMA" are separate:
+// refresh, privilege removal, deletion and moving a grant each touch only the
+// configured schema.
+func TestAccObjectPrivilege_CaseTwinGrants(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(lowerGrant, upperTarget, upperPrivs string) string {
+		return providerConfig() + `
+resource "exasol_schema" "upper" {
+  name = "ACC_CTW_SCHEMA"
+}
+resource "exasol_schema" "lower" {
+  name = "acc_ctw_schema"
+}
+resource "exasol_role" "r" {
+  name = "ACC_CTW_ROLE"
+}
+resource "exasol_object_privilege" "up" {
+  grantee     = exasol_role.r.name
+  privileges  = ` + upperPrivs + `
+  object_type = "SCHEMA"
+  object_name = exasol_schema.` + upperTarget + `.name
+}` + lowerGrant
+	}
+	lowerGrant := func(privs string) string {
+		return `
+resource "exasol_object_privilege" "low" {
+  grantee     = exasol_role.r.name
+  privileges  = ` + privs + `
+  object_type = "SCHEMA"
+  object_name = exasol_schema.lower.name
+}`
+	}
+	privs := func(schema, want string) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			// Exasol treats '' as NULL, so no rows yield NULL here
+			var got sql.NullString
+			if err := db.QueryRow(`SELECT GROUP_CONCAT(PRIVILEGE ORDER BY PRIVILEGE) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_CTW_ROLE' AND OBJECT_NAME = ?`, schema).Scan(&got); err != nil {
+				return err
+			}
+			if got.String != want {
+				return fmt.Errorf("privileges on %s: got %q, want %q", schema, got.String, want)
+			}
+			return nil
+		}
+	}
+	both := `["SELECT", "INSERT"]`
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			// Grants on both twins; the refresh plan must be empty
+			{
+				Config: config(lowerGrant(both), "upper", both),
+				Check:  resource.ComposeAggregateTestCheckFunc(privs("acc_ctw_schema", "INSERT,SELECT"), privs("ACC_CTW_SCHEMA", "INSERT,SELECT")),
+			},
+			// Remove INSERT on the lowercase twin only
+			{
+				Config: config(lowerGrant(`["SELECT"]`), "upper", both),
+				Check:  resource.ComposeAggregateTestCheckFunc(privs("acc_ctw_schema", "SELECT"), privs("ACC_CTW_SCHEMA", "INSERT,SELECT")),
+			},
+			// Delete the lowercase twin's grant
+			{
+				Config: config("", "upper", both),
+				Check:  resource.ComposeAggregateTestCheckFunc(privs("acc_ctw_schema", ""), privs("ACC_CTW_SCHEMA", "INSERT,SELECT")),
+			},
+			// Move the uppercase grant to the lowercase twin
+			{
+				Config: config("", "lower", both),
+				Check:  resource.ComposeAggregateTestCheckFunc(privs("acc_ctw_schema", "INSERT,SELECT"), privs("ACC_CTW_SCHEMA", "")),
+			},
+		},
+	})
+}
+
 func TestAccObjectPrivilege_OnSchema(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },

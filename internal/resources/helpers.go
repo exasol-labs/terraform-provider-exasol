@@ -36,8 +36,9 @@ func isTrueAdminOption(v string) bool {
 	return v == "TRUE" || v == "1" || v == "true"
 }
 
-// existsFunc reports whether a database object with the given uppercase name
-// exists.
+// existsFunc reports whether a database object with the given name exists.
+// Names are compared as Exasol stores them: users, roles and connections in
+// uppercase, schema objects with their case.
 type existsFunc func(ctx context.Context, db *sql.DB, name string) (bool, error)
 
 // resolveEndpoint returns where a grant endpoint (grantee, role, connection or
@@ -82,36 +83,55 @@ func renamedAway(renames *exasolclient.RenameLog, kind, oldName, newName string)
 }
 
 // objectRenamedAway does the same for the schema of an object privilege target.
+// Schema names are compared with their case, like in the rename log.
 func objectRenamedAway(renames *exasolclient.RenameLog, oldName, newName string) bool {
-	oldSchema, _, _ := strings.Cut(strings.ToUpper(strings.ReplaceAll(oldName, `"`, "")), ".")
-	newSchema, _, _ := strings.Cut(strings.ToUpper(strings.ReplaceAll(newName, `"`, "")), ".")
+	oldSchema, _, _ := strings.Cut(strings.ReplaceAll(oldName, `"`, ""), ".")
+	newSchema, _, _ := strings.Cut(strings.ReplaceAll(newName, `"`, ""), ".")
 	return renamedAway(renames, exasolclient.RenameSchema, oldSchema, newSchema)
 }
 
-// resolveObject does the same for an object privilege target: a schema name, or
-// SCHEMA.NAME whose schema may have been renamed. Names are uppercase; quotes
-// are removed, as in qualify().
+// objectTarget returns the name to look up and revoke for an object privilege
+// target, and whether that object exists. Quoted names are case-sensitive in
+// Exasol and exasol_schema keeps the configured case, so "s" and "S" can both
+// exist: the exact spelling wins. Only when no object has the exact spelling
+// is the uppercase one used, e.g. for a lowercase spelling of an uppercase
+// object in an import. Quotes are ignored, as in qualify().
+func objectTarget(ctx context.Context, db *sql.DB, name string) (string, bool, error) {
+	exact := strings.ReplaceAll(name, `"`, "")
+	found, err := objectExists(ctx, db, exact)
+	if err != nil || found {
+		return exact, found, err
+	}
+	upper := strings.ToUpper(exact)
+	if upper == exact {
+		return exact, false, nil
+	}
+	found, err = objectExists(ctx, db, upper)
+	return upper, found, err
+}
+
+// resolveObject does the same for an object privilege target: a schema name,
+// or SCHEMA.NAME whose schema may have been renamed. It returns the target as
+// objectTarget does.
 func resolveObject(ctx context.Context, db *sql.DB, renames *exasolclient.RenameLog, oldName, newName string) (string, bool, error) {
 	oldName = strings.ReplaceAll(oldName, `"`, "")
 	newName = strings.ReplaceAll(newName, `"`, "")
 	schema, object, qualified := strings.Cut(oldName, ".")
 	if current, ok := renames.Lookup(exasolclient.RenameSchema, schema); ok {
 		if qualified {
-			return current + "." + object, false, nil
+			current += "." + object
 		}
-		return current, false, nil
+		target, _, err := objectTarget(ctx, db, current)
+		return target, false, err
 	}
-	if oldName == newName {
-		return oldName, false, nil
-	}
-	found, err := objectExists(ctx, db, oldName)
+	target, found, err := objectTarget(ctx, db, oldName)
 	if err != nil {
 		return "", false, err
 	}
-	if !found {
-		return "", true, nil
+	if oldName == newName || found {
+		return target, false, nil
 	}
-	return oldName, false, nil
+	return "", true, nil
 }
 
 func rowExists(ctx context.Context, db *sql.DB, query string, args ...any) (bool, error) {

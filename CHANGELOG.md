@@ -17,7 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Renames now hold the grant lock (see below), so a grant update cannot run between a rename and its record
 - `exasol_object_privilege` on a table or view (`object_name = "SCHEMA.TABLE"`) is found again on refresh. Exasol stores the schema and the object name in separate columns, so the lookup never matched: every plan wanted to create the grant again. Schema grants were not affected
 - `exasol_object_privilege`: moving an `ALL` grant to a grantee that already holds one of its privileges now grants all of them
-- `exasol_object_privilege`: an object name stored in lowercase (for example by an import) no longer makes `REVOKE` fail; lookup and `REVOKE` use the same uppercase name. A failed `REVOKE` during an update is now an error instead of a log warning
+- `exasol_object_privilege`: lookup and `REVOKE` use the exact object name when an object with that spelling exists, otherwise its uppercase spelling. A lowercase name in state for an uppercase object (for example from an import) no longer makes `REVOKE` fail, and grants on schemas that differ only in case (`s` and `S`, which `exasol_schema` can create) are kept apart. Refresh now also finds grants on lowercase schemas, which were created again on every plan before. A failed `REVOKE` during an update is now an error instead of a log warning
 - Grant updates are serialized with deletes, like deletes already were, to avoid Exasol transaction collisions (error 40001)
 
 ## [0.2.5] - 2026-09-16
