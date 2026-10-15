@@ -1073,6 +1073,151 @@ resource "exasol_object_privilege" "script" {
 	})
 }
 
+// Exasol expands ALL into one row per privilege. Moving an ALL grant to a
+// grantee that already holds one of those privileges must still grant ALL.
+func TestAccObjectPrivilege_AllToGranteeWithPartialPrivileges(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(grantee string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "s" {
+  name = "ACC_OBJALL_SCHEMA"
+}
+resource "exasol_role" "rx" {
+  name = "ACC_OBJALL_RX"
+}
+resource "exasol_role" "ra" {
+  name = "ACC_OBJALL_RA"
+}
+resource "exasol_object_privilege" "all" {
+  grantee     = exasol_role.%s.name
+  privileges  = ["ALL"]
+  object_type = "SCHEMA"
+  object_name = exasol_schema.s.name
+}`, grantee)
+	}
+	privCount := func(grantee string) (int, error) {
+		var n int
+		err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ? AND OBJECT_TYPE = 'SCHEMA' AND OBJECT_NAME = 'ACC_OBJALL_SCHEMA'`, grantee).Scan(&n)
+		return n, err
+	}
+	var allRows int
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckObjectPrivilegeDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("rx"),
+				Check: func(_ *terraform.State) error {
+					n, err := privCount("ACC_OBJALL_RX")
+					if err != nil {
+						return err
+					}
+					if n < 2 {
+						return fmt.Errorf("ALL on schema expanded to %d rows, want at least 2", n)
+					}
+					allRows = n
+					return nil
+				},
+			},
+			{
+				PreConfig: func() {
+					if _, err := db.Exec(`GRANT SELECT ON SCHEMA ACC_OBJALL_SCHEMA TO ACC_OBJALL_RA`); err != nil {
+						t.Fatalf("grant outside Terraform: %v", err)
+					}
+				},
+				Config: config("ra"),
+				Check: func(_ *terraform.State) error {
+					ra, err := privCount("ACC_OBJALL_RA")
+					if err != nil {
+						return err
+					}
+					rx, err := privCount("ACC_OBJALL_RX")
+					if err != nil {
+						return err
+					}
+					if ra != allRows || rx != 0 {
+						return fmt.Errorf("after moving ALL: RA holds %d (want %d), RX holds %d (want 0)", ra, allRows, rx)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// Moving a grant WITH ADMIN OPTION to a grantee that already holds it without
+// admin option must end with the admin option set.
+func TestAccGrant_MoveToGranteeWithoutAdminOption(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(grantee string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_role" "granted" {
+  name = "ACC_ADMMOVE_GRANTED"
+}
+resource "exasol_role" "rx" {
+  name = "ACC_ADMMOVE_RX"
+}
+resource "exasol_role" "ra" {
+  name = "ACC_ADMMOVE_RA"
+}
+resource "exasol_role_grant" "g" {
+  role              = exasol_role.granted.name
+  grantee           = exasol_role.%[1]s.name
+  with_admin_option = true
+}
+resource "exasol_system_privilege" "p" {
+  grantee           = exasol_role.%[1]s.name
+  privilege         = "CREATE TABLE"
+  with_admin_option = true
+}`, grantee)
+	}
+	adminRows := func(want int) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			for _, q := range []string{
+				`SELECT COUNT(*) FROM EXA_DBA_ROLE_PRIVS WHERE GRANTED_ROLE = 'ACC_ADMMOVE_GRANTED' AND GRANTEE = 'ACC_ADMMOVE_RA' AND ADMIN_OPTION IN ('TRUE', 'true', '1')`,
+				`SELECT COUNT(*) FROM EXA_DBA_SYS_PRIVS WHERE PRIVILEGE = 'CREATE TABLE' AND GRANTEE = 'ACC_ADMMOVE_RA' AND ADMIN_OPTION IN ('TRUE', 'true', '1')`,
+			} {
+				var n int
+				if err := db.QueryRow(q).Scan(&n); err != nil {
+					return err
+				}
+				if n != want {
+					return fmt.Errorf("%s: got %d, want %d", q, n, want)
+				}
+			}
+			return nil
+		}
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("rx"),
+				Check:  adminRows(0),
+			},
+			{
+				PreConfig: func() {
+					for _, stmt := range []string{
+						`GRANT ACC_ADMMOVE_GRANTED TO ACC_ADMMOVE_RA`,
+						`GRANT CREATE TABLE TO ACC_ADMMOVE_RA`,
+					} {
+						if _, err := db.Exec(stmt); err != nil {
+							t.Fatalf("grant outside Terraform %q: %v", stmt, err)
+						}
+					}
+				},
+				Config: config("ra"),
+				Check:  adminRows(1),
+			},
+		},
+	})
+}
+
 func TestAccObjectPrivilege_OnSchema(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },

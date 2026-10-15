@@ -229,16 +229,21 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 			}
 		}
 
-		// Grant new privileges
+		// Grant new privileges. A single privilege moved by a rename is skipped.
+		// ALL is always granted: Exasol expands it into one row per privilege,
+		// so one existing row does not mean ALL is held, and GRANT ALL is
+		// idempotent.
 		for _, privilege := range newPrivileges {
 			priv := strings.ToUpper(privilege)
-			exists, err := checkObjectPrivilegeExists(ctx, r.db, newGrantee, priv, newObjectType, strings.ToUpper(plan.ObjectName.ValueString()))
-			if err != nil {
-				resp.Diagnostics.AddError("Check object privilege failed", err.Error())
-				return
-			}
-			if exists {
-				continue
+			if priv != "ALL" {
+				exists, err := checkObjectPrivilegeExists(ctx, r.db, newGrantee, priv, newObjectType, strings.ToUpper(plan.ObjectName.ValueString()))
+				if err != nil {
+					resp.Diagnostics.AddError("Check object privilege failed", err.Error())
+					return
+				}
+				if exists {
+					continue
+				}
 			}
 			grantStmt := fmt.Sprintf(`GRANT %s ON %s %s TO "%s"`, priv, newObjectType, newObjectName, newGrantee)
 			tflog.Info(ctx, "Granting new object privilege", map[string]any{"sql": grantStmt})
