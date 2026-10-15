@@ -457,6 +457,80 @@ resource "exasol_system_privilege" "session" {
 	})
 }
 
+// Renaming a user must keep every grant that references it: Exasol moves
+// privileges, role grants and impersonation rights to the new name.
+func TestAccUser_RenameWithGrants(t *testing.T) {
+	config := func(name string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_user" "u" {
+  name      = %q
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_system_privilege" "session" {
+  grantee   = exasol_user.u.name
+  privilege = "CREATE SESSION"
+}
+resource "exasol_role" "r" {
+  name = "ACC_RENAME_ROLE"
+}
+resource "exasol_role_grant" "r" {
+  role    = exasol_role.r.name
+  grantee = exasol_user.u.name
+}
+resource "exasol_schema" "s" {
+  name = "ACC_RENAME_SCHEMA"
+}
+resource "exasol_object_privilege" "s" {
+  grantee     = exasol_user.u.name
+  privileges  = ["SELECT"]
+  object_type = "SCHEMA"
+  object_name = exasol_schema.s.name
+}
+resource "exasol_connection" "c" {
+  name = "ACC_RENAME_CONN"
+  to   = "localhost:8563"
+}
+resource "exasol_connection_grant" "c" {
+  connection_name = exasol_connection.c.name
+  grantee         = exasol_user.u.name
+}
+resource "exasol_user" "other" {
+  name      = "ACC_RENAME_OTHER"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_user_impersonation_grant" "as_grantee" {
+  grantee = exasol_user.u.name
+  target  = exasol_user.other.name
+}
+resource "exasol_user_impersonation_grant" "as_target" {
+  grantee = exasol_role.r.name
+  target  = exasol_user.u.name
+}`, name)
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckUserDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("ACC_RENAME_A"),
+				Check:  testAccCheckUserLogin("ACC_RENAME_A", "TestPass123", true),
+			},
+			{
+				Config: config("ACC_RENAME_B"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("exasol_user.u", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: testAccCheckUserLogin("ACC_RENAME_B", "TestPass123", true),
+			},
+		},
+	})
+}
+
 // testAccCheckUserLogin checks the user's direct CREATE SESSION grant and
 // whether a login with the given password succeeds.
 func testAccCheckUserLogin(user, password string, wantLogin bool) resource.TestCheckFunc {

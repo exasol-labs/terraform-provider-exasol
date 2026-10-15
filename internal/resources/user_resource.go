@@ -69,6 +69,7 @@ func (r *UserResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 // ModifyPlan warns when a user is about to be created. Up to v0.2.x the
 // provider granted CREATE SESSION implicitly; configurations that relied on it
 // need an exasol_system_privilege resource now, or the new user cannot log in.
+// Remove this warning in v0.4.0, once the migration window has passed.
 func (r *UserResource) ModifyPlan(_ context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if !req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
 		return

@@ -210,9 +210,18 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 
 	// If grantee, object type, or object name changed, revoke all old and grant all new
 	if oldGrantee != newGrantee || oldObjectType != newObjectType || oldObjectName != newObjectName {
-		// Revoke old privileges
+		// Renaming the grantee in Exasol moves its privileges to the new name,
+		// so old privileges may be gone and new ones may already exist.
 		for _, privilege := range oldPrivileges {
 			priv := strings.ToUpper(privilege)
+			exists, err := checkObjectPrivilegeExists(ctx, r.db, oldGrantee, priv, oldObjectType, strings.ToUpper(state.ObjectName.ValueString()))
+			if err != nil {
+				resp.Diagnostics.AddError("Check object privilege failed", err.Error())
+				return
+			}
+			if !exists {
+				continue
+			}
 			revokeStmt := fmt.Sprintf(`REVOKE %s ON %s %s FROM "%s"`, priv, oldObjectType, oldObjectName, oldGrantee)
 			tflog.Info(ctx, "Revoking old object privilege", map[string]any{"sql": revokeStmt})
 			if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
@@ -223,6 +232,14 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 		// Grant new privileges
 		for _, privilege := range newPrivileges {
 			priv := strings.ToUpper(privilege)
+			exists, err := checkObjectPrivilegeExists(ctx, r.db, newGrantee, priv, newObjectType, strings.ToUpper(plan.ObjectName.ValueString()))
+			if err != nil {
+				resp.Diagnostics.AddError("Check object privilege failed", err.Error())
+				return
+			}
+			if exists {
+				continue
+			}
 			grantStmt := fmt.Sprintf(`GRANT %s ON %s %s TO "%s"`, priv, newObjectType, newObjectName, newGrantee)
 			tflog.Info(ctx, "Granting new object privilege", map[string]any{"sql": grantStmt})
 			if _, err := r.db.ExecContext(ctx, grantStmt); err != nil {
@@ -295,9 +312,18 @@ func (r *ObjectPrivilegeResource) Delete(ctx context.Context, req resource.Delet
 		return
 	}
 
-	// Revoke each privilege
+	// Revoke each privilege that still exists; a renamed or dropped grantee
+	// leaves nothing to revoke.
 	for _, privilege := range privileges {
 		priv := strings.ToUpper(privilege)
+		exists, err := checkObjectPrivilegeExists(ctx, r.db, grantee, priv, objectType, strings.ToUpper(state.ObjectName.ValueString()))
+		if err != nil {
+			resp.Diagnostics.AddError("Check object privilege failed", err.Error())
+			return
+		}
+		if !exists {
+			continue
+		}
 		stmt := fmt.Sprintf(`REVOKE %s ON %s %s FROM "%s"`, priv, objectType, objectName, grantee)
 		tflog.Info(ctx, "Revoking object privilege", map[string]any{"sql": stmt})
 		if _, err := r.db.ExecContext(ctx, stmt); err != nil {

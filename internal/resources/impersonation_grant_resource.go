@@ -167,16 +167,29 @@ func (r *ImpersonationGrantResource) Update(ctx context.Context, req resource.Up
 		resp.Diagnostics.AddError("Check new impersonation grant failed", err.Error())
 		return
 	}
-	_, revoke := impersonationGrantSQL(oldGrantee, oldTarget)
-	tflog.Info(ctx, "Revoking old impersonation", map[string]any{"sql": revoke})
-	if _, err := r.db.ExecContext(ctx, revoke); err != nil {
-		resp.Diagnostics.AddError("REVOKE IMPERSONATION failed", err.Error())
+	// Renaming the grantee or target in Exasol moves the grant to the new
+	// name, so the old grant may be gone.
+	oldExists, err := r.grantExists(ctx, oldGrantee, oldTarget)
+	if err != nil {
+		resp.Diagnostics.AddError("Check old impersonation grant failed", err.Error())
 		return
+	}
+	if oldExists {
+		_, revoke := impersonationGrantSQL(oldGrantee, oldTarget)
+		tflog.Info(ctx, "Revoking old impersonation", map[string]any{"sql": revoke})
+		if _, err := r.db.ExecContext(ctx, revoke); err != nil {
+			resp.Diagnostics.AddError("REVOKE IMPERSONATION failed", err.Error())
+			return
+		}
 	}
 	if !newExists {
 		grant, _ := impersonationGrantSQL(newGrantee, newTarget)
 		tflog.Info(ctx, "Granting new impersonation", map[string]any{"sql": grant})
 		if _, err := r.db.ExecContext(ctx, grant); err != nil {
+			if !oldExists {
+				resp.Diagnostics.AddError("GRANT IMPERSONATION failed", err.Error())
+				return
+			}
 			oldGrant, _ := impersonationGrantSQL(oldGrantee, oldTarget)
 			tflog.Warn(ctx, "Restoring old impersonation after failed update", map[string]any{"sql": oldGrant})
 			if _, rollbackErr := r.db.ExecContext(ctx, oldGrant); rollbackErr != nil {

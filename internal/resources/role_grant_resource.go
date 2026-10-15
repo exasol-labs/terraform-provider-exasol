@@ -170,27 +170,51 @@ func (r *RoleGrantResource) Update(ctx context.Context, req resource.UpdateReque
 	if plan.Role.ValueString() != state.Role.ValueString() ||
 		plan.Grantee.ValueString() != state.Grantee.ValueString() {
 
-		// Revoke old role grant
+		// Renaming a role or grantee in Exasol moves its grants to the new
+		// name, so the old grant may be gone and the new one may already exist.
 		oldRole := strings.ToUpper(state.Role.ValueString())
 		oldGrantee := strings.ToUpper(state.Grantee.ValueString())
-		revokeStmt := fmt.Sprintf(`REVOKE "%s" FROM "%s"`, oldRole, oldGrantee)
-		tflog.Info(ctx, "Revoking old role grant", map[string]any{"sql": revokeStmt})
-		if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
-			resp.Diagnostics.AddError("REVOKE failed", err.Error())
+		oldExists, _, err := r.grantExists(ctx, oldRole, oldGrantee)
+		if err != nil {
+			resp.Diagnostics.AddError("Check role grant failed", err.Error())
 			return
+		}
+		if oldExists {
+			revokeStmt := fmt.Sprintf(`REVOKE "%s" FROM "%s"`, oldRole, oldGrantee)
+			tflog.Info(ctx, "Revoking old role grant", map[string]any{"sql": revokeStmt})
+			if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+				resp.Diagnostics.AddError("REVOKE failed", err.Error())
+				return
+			}
 		}
 
-		// Grant new role
 		newRole := strings.ToUpper(plan.Role.ValueString())
 		newGrantee := strings.ToUpper(plan.Grantee.ValueString())
-		grantStmt := fmt.Sprintf(`GRANT "%s" TO "%s"`, newRole, newGrantee)
-		if !plan.WithAdminOption.IsNull() && plan.WithAdminOption.ValueBool() {
-			grantStmt += " WITH ADMIN OPTION"
-		}
-		tflog.Info(ctx, "Granting new role", map[string]any{"sql": grantStmt})
-		if _, err := r.db.ExecContext(ctx, grantStmt); err != nil {
-			resp.Diagnostics.AddError("GRANT failed", err.Error())
+		wantAdmin := !plan.WithAdminOption.IsNull() && plan.WithAdminOption.ValueBool()
+		newExists, newAdmin, err := r.grantExists(ctx, newRole, newGrantee)
+		if err != nil {
+			resp.Diagnostics.AddError("Check role grant failed", err.Error())
 			return
+		}
+		if newExists && newAdmin != wantAdmin {
+			revokeStmt := fmt.Sprintf(`REVOKE "%s" FROM "%s"`, newRole, newGrantee)
+			tflog.Info(ctx, "Revoking role to update admin option", map[string]any{"sql": revokeStmt})
+			if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+				resp.Diagnostics.AddError("REVOKE failed", err.Error())
+				return
+			}
+			newExists = false
+		}
+		if !newExists {
+			grantStmt := fmt.Sprintf(`GRANT "%s" TO "%s"`, newRole, newGrantee)
+			if wantAdmin {
+				grantStmt += " WITH ADMIN OPTION"
+			}
+			tflog.Info(ctx, "Granting new role", map[string]any{"sql": grantStmt})
+			if _, err := r.db.ExecContext(ctx, grantStmt); err != nil {
+				resp.Diagnostics.AddError("GRANT failed", err.Error())
+				return
+			}
 		}
 	} else if plan.WithAdminOption.ValueBool() != state.WithAdminOption.ValueBool() {
 		// Only admin option changed - need to revoke and re-grant
@@ -236,6 +260,15 @@ func (r *RoleGrantResource) Delete(ctx context.Context, req resource.DeleteReque
 
 	role := strings.ToUpper(state.Role.ValueString())
 	grantee := strings.ToUpper(state.Grantee.ValueString())
+	// Already gone, e.g. the grantee was renamed or dropped: nothing to revoke.
+	exists, _, err := r.grantExists(ctx, role, grantee)
+	if err != nil {
+		resp.Diagnostics.AddError("Check role grant failed", err.Error())
+		return
+	}
+	if !exists {
+		return
+	}
 	stmt := fmt.Sprintf(`REVOKE "%s" FROM "%s"`, role, grantee)
 
 	tflog.Info(ctx, "Revoking role grant", map[string]any{"sql": stmt})
@@ -266,4 +299,20 @@ func roleGrantID(m roleGrantModel) string {
 		adminOption = "true"
 	}
 	return fmt.Sprintf("%s|%s|%s", role, grantee, adminOption)
+}
+
+// grantExists reports whether role is granted to grantee, and with which admin
+// option.
+func (r *RoleGrantResource) grantExists(ctx context.Context, role, grantee string) (bool, bool, error) {
+	var adminOption string
+	err := r.db.QueryRowContext(ctx,
+		`SELECT ADMIN_OPTION FROM EXA_DBA_ROLE_PRIVS WHERE GRANTED_ROLE = ? AND GRANTEE = ?`,
+		role, grantee).Scan(&adminOption)
+	if err == sql.ErrNoRows {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	return true, isTrueAdminOption(adminOption), nil
 }

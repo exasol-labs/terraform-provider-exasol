@@ -25,3 +25,9 @@ func qualify(obj string) string {
 	}
 	return strings.Join(parts, ".")
 }
+
+// isTrueAdminOption interprets the ADMIN_OPTION column of EXA_DBA_SYS_PRIVS and
+// EXA_DBA_ROLE_PRIVS. SaaS returns "TRUE"/"1", Docker returns "true".
+func isTrueAdminOption(v string) bool {
+	return v == "TRUE" || v == "1" || v == "true"
+}

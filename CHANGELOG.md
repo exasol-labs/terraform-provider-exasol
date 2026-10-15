@@ -4,12 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.3.0] - 2026-10-15
 
 ### Changed
 - **BREAKING:** `exasol_user` no longer grants `CREATE SESSION` on create. It only runs `CREATE USER`, like Exasol itself, so login is managed in one place and can be revoked by Terraform. Users created with this version cannot log in until you add an `exasol_system_privilege` resource with `privilege = "CREATE SESSION"`. Existing users keep their grant and show no plan change. `terraform plan` shows a warning for each `exasol_user` that is about to be created
-  - Migration: before or after upgrading, add `exasol_system_privilege` with `privilege = "CREATE SESSION"` for every user that should log in, for example with `for_each = exasol_user.<name>`. Applying it re-grants an existing privilege, which Exasol accepts without change; alternatively import it with the ID `USER|CREATE SESSION|false`
+  - Migration: before or after upgrading, add one `exasol_system_privilege` with `privilege = "CREATE SESSION"` per user that should log in (`grantee = exasol_user.<name>.name`; if your users use `for_each`, use `for_each = exasol_user.<name>` and `grantee = each.value.name`). Applying it re-grants an existing privilege, which Exasol accepts without change; alternatively import it with the ID `USER|CREATE SESSION|false`
   - A user replaced with `-replace` or `taint` is created without `CREATE SESSION`. No warning is shown in this case, because Terraform passes the prior state to the provider
+
+### Fixed
+- Renaming a user or role no longer fails in `exasol_system_privilege`, `exasol_role_grant`, `exasol_object_privilege`, `exasol_connection_grant`, `exasol_user_impersonation_grant` and `exasol_role_impersonation_grant`. Exasol moves grants to the new name itself; these resources now revoke a grant only if it still exists and skip the grant if it already exists. `Delete` also no longer fails when the grant is already gone
 
 ## [0.2.5] - 2026-09-16
 
