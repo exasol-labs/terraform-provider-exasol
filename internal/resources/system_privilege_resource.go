@@ -181,6 +181,9 @@ func (r *SystemPrivilegeResource) Update(ctx context.Context, req resource.Updat
 		oldPrivilege := strings.ToUpper(state.Privilege.ValueString())
 		newGrantee := strings.ToUpper(plan.Grantee.ValueString())
 		newPrivilege := strings.ToUpper(plan.Privilege.ValueString())
+		if !requireExists(ctx, r.db, resp.Diagnostics.AddError, "Grantee", newGrantee, principalExists) {
+			return
+		}
 
 		// Find where the previous grant lives now: Exasol moves privileges to
 		// the new name when the grantee is renamed. Revoke it there unless it

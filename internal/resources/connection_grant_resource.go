@@ -174,6 +174,10 @@ func (r *ConnectionGrantResource) Update(ctx context.Context, req resource.Updat
 
 	// If either changed, revoke old grant and create new one
 	if oldConnection != newConnection || oldGrantee != newGrantee {
+		if !requireExists(ctx, r.db, resp.Diagnostics.AddError, "Connection", newConnection, connectionExists) ||
+			!requireExists(ctx, r.db, resp.Diagnostics.AddError, "Grantee", newGrantee, principalExists) {
+			return
+		}
 		// Find where the previous grant lives now: Exasol moves grants to the
 		// new name when the connection or grantee is renamed. Revoke it there
 		// unless it is the grant this resource keeps. A dropped connection or

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -2305,6 +2306,178 @@ resource "exasol_role" "r" {
 			{
 				Config: config("acc_crs", `["SELECT"]`),
 				Check:  objPrivs(db, "ACC_CRS_ROLE", "acc_crs", "SELECT"),
+			},
+		},
+	})
+}
+
+// Imported spelling plus schema swap: "acc_iss" was imported for schema
+// ACC_ISS; in one apply ACC_ISS is renamed to ACC_ISS_T and schema b to
+// "acc_iss", and the grant moves to b with SELECT only.
+func TestAccObjectPrivilege_ImportedSpellingSchemaSwap(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(aName, bName, privs string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "a" {
+  name = %q
+}
+resource "exasol_schema" "b" {
+  name       = %q
+  depends_on = [exasol_schema.a]
+}
+resource "exasol_role" "r" {
+  name = "ACC_ISS_ROLE"
+}
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "SCHEMA"
+  object_name = "acc_iss"
+  depends_on  = [exasol_schema.b]
+}`, aName, bName, privs)
+	}
+	both := `["SELECT", "INSERT"]`
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{Config: providerConfig() + `
+resource "exasol_schema" "a" {
+  name = "ACC_ISS"
+}
+resource "exasol_schema" "b" {
+  name       = "ACC_ISS_B"
+  depends_on = [exasol_schema.a]
+}
+resource "exasol_role" "r" {
+  name = "ACC_ISS_ROLE"
+}`},
+			{
+				PreConfig: func() {
+					for _, stmt := range []string{
+						`GRANT SELECT ON SCHEMA ACC_ISS TO ACC_ISS_ROLE`,
+						`GRANT INSERT ON SCHEMA ACC_ISS TO ACC_ISS_ROLE`,
+					} {
+						if _, err := db.Exec(stmt); err != nil {
+							t.Fatalf("grant outside Terraform %q: %v", stmt, err)
+						}
+					}
+				},
+				Config:             config("ACC_ISS", "ACC_ISS_B", both),
+				ResourceName:       "exasol_object_privilege.o",
+				ImportState:        true,
+				ImportStateId:      "ACC_ISS_ROLE|SELECT,INSERT|SCHEMA|acc_iss",
+				ImportStatePersist: true,
+			},
+			{
+				Config: config("ACC_ISS", "ACC_ISS_B", both),
+				Check:  objPrivs(db, "ACC_ISS_ROLE", "ACC_ISS", "INSERT,SELECT"),
+			},
+			{
+				Config: config("ACC_ISS_T", "acc_iss", `["SELECT"]`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					objPrivs(db, "ACC_ISS_ROLE", "ACC_ISS_T", ""),
+					objPrivs(db, "ACC_ISS_ROLE", "acc_iss", "SELECT"),
+				),
+			},
+		},
+	})
+}
+
+// Moving a grant to an endpoint that does not exist must fail before any
+// REVOKE, so the existing grant stays. Covers all grant resources.
+func TestAccGrant_MissingNewEndpointKeepsOldGrant(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(grantee, role, conn, target, schema string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_user" "u" {
+  name      = "ACC_MNE_USER"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_user" "t" {
+  name      = "ACC_MNE_TARGET"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_role" "r" {
+  name = "ACC_MNE_ROLE"
+}
+resource "exasol_connection" "c" {
+  name = "ACC_MNE_CONN"
+  to   = "localhost:8563"
+}
+resource "exasol_schema" "s" {
+  name = "ACC_MNE_SCHEMA"
+}
+resource "exasol_system_privilege" "p" {
+  grantee    = %[1]q
+  privilege  = "CREATE TABLE"
+  depends_on = [exasol_user.u]
+}
+resource "exasol_role_grant" "g" {
+  role       = %[2]q
+  grantee    = exasol_user.u.name
+  depends_on = [exasol_role.r]
+}
+resource "exasol_connection_grant" "cg" {
+  connection_name = %[3]q
+  grantee         = exasol_user.u.name
+  depends_on      = [exasol_connection.c]
+}
+resource "exasol_user_impersonation_grant" "i" {
+  grantee    = %[1]q
+  target     = %[4]q
+  depends_on = [exasol_user.u, exasol_user.t]
+}
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_user.u.name
+  privileges  = ["SELECT"]
+  object_type = "SCHEMA"
+  object_name = %[5]q
+  depends_on  = [exasol_schema.s]
+}`, grantee, role, conn, target, schema)
+	}
+	good := config("ACC_MNE_USER", "ACC_MNE_ROLE", "ACC_MNE_CONN", "ACC_MNE_TARGET", "ACC_MNE_SCHEMA")
+	held := func(_ *terraform.State) error {
+		var n int
+		err := db.QueryRow(`SELECT
+  (SELECT COUNT(*) FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE = 'ACC_MNE_USER' AND PRIVILEGE = 'CREATE TABLE') +
+  (SELECT COUNT(*) FROM EXA_DBA_ROLE_PRIVS WHERE GRANTEE = 'ACC_MNE_USER' AND GRANTED_ROLE = 'ACC_MNE_ROLE') +
+  (SELECT COUNT(*) FROM EXA_DBA_CONNECTION_PRIVS WHERE GRANTEE = 'ACC_MNE_USER' AND GRANTED_CONNECTION = 'ACC_MNE_CONN') +
+  (SELECT COUNT(*) FROM EXA_DBA_IMPERSONATION_PRIVS WHERE GRANTEE = 'ACC_MNE_USER' AND IMPERSONATION_ON = 'ACC_MNE_TARGET') +
+  (SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_MNE_USER' AND OBJECT_NAME = 'ACC_MNE_SCHEMA' AND PRIVILEGE = 'SELECT')`).Scan(&n)
+		if err != nil {
+			return err
+		}
+		if n != 5 {
+			return fmt.Errorf("ACC_MNE_USER holds %d of its 5 grants", n)
+		}
+		return nil
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckUserDestroy,
+		Steps: []resource.TestStep{
+			{Config: good, Check: held},
+			// Every grant moves to an endpoint that does not exist
+			{
+				Config:      config("ACC_MNE_NOBODY", "ACC_MNE_NOROLE", "ACC_MNE_NOCONN", "ACC_MNE_NOTARGET", "ACC_MNE_NOSCHEMA"),
+				ExpectError: regexp.MustCompile(`does not exist`),
+			},
+			// Nothing was revoked: back to the original config, all grants held
+			{
+				PreConfig: func() {
+					if err := held(nil); err != nil {
+						t.Fatalf("after refused update: %v", err)
+					}
+				},
+				Config: good,
+				Check:  held,
 			},
 		},
 	})

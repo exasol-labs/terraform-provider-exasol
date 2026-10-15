@@ -185,6 +185,10 @@ func (r *RoleGrantResource) Update(ctx context.Context, req resource.UpdateReque
 		oldGrantee := strings.ToUpper(state.Grantee.ValueString())
 		newRole := strings.ToUpper(plan.Role.ValueString())
 		newGrantee := strings.ToUpper(plan.Grantee.ValueString())
+		if !requireExists(ctx, r.db, resp.Diagnostics.AddError, "Role", newRole, roleExists) ||
+			!requireExists(ctx, r.db, resp.Diagnostics.AddError, "Grantee", newGrantee, principalExists) {
+			return
+		}
 
 		// Find where the previous grant lives now: Exasol moves grants to the
 		// new name when the role or grantee is renamed. Revoke it there unless

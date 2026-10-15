@@ -168,6 +168,9 @@ func (r *ImpersonationGrantResource) Update(ctx context.Context, req resource.Up
 		resp.Diagnostics.AddError("Invalid impersonation grant", err.Error())
 		return
 	}
+	if !requireExists(ctx, r.db, resp.Diagnostics.AddError, "Grantee", newGrantee, principalExists) {
+		return
+	}
 
 	newExists, err := r.grantExists(ctx, newGrantee, newTarget)
 	if err != nil {

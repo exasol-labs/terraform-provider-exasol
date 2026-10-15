@@ -133,6 +133,23 @@ func resolveKnownObject(ctx context.Context, db *sql.DB, renames *exasolclient.R
 	return oldTarget, !found, nil
 }
 
+// requireExists adds an error and returns false when a new grant endpoint does
+// not exist. Update calls it before any REVOKE, so a grant moved to a missing
+// grantee, role, connection, target or object fails without removing access.
+func requireExists(ctx context.Context, db *sql.DB, add func(string, string), what, name string, exists existsFunc) bool {
+	found, err := exists(ctx, db, name)
+	if err != nil {
+		add(fmt.Sprintf("Check %s failed", strings.ToLower(what)), err.Error())
+		return false
+	}
+	if !found {
+		add(fmt.Sprintf("%s does not exist", what),
+			fmt.Sprintf("%s %q does not exist, so the grant cannot move to it. Nothing was revoked.", what, name))
+		return false
+	}
+	return true
+}
+
 func rowExists(ctx context.Context, db *sql.DB, query string, args ...any) (bool, error) {
 	var dummy int
 	err := db.QueryRowContext(ctx, query, args...).Scan(&dummy)

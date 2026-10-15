@@ -240,20 +240,24 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 	// spelling is resolved like an unknown target, so GRANT below goes where
 	// the lookups go.
 	//
-	// With an unchanged spelling, a schema of the known target renamed in this
-	// run is followed only if the new name is exactly the configured spelling
-	// (e.g. "S" renamed to "s" for an imported spelling "s"). Otherwise another
-	// object may have taken over the configured name (a swap), which
-	// objectRenamedAway below handles with the known target.
+	// With an unchanged spelling, if the known target's schema was renamed in
+	// this run, the configured spelling now names whatever object holds it
+	// exactly: the renamed object itself ("S" renamed to "s" for an imported
+	// spelling "s"), or another object that took over the name (a swap). If no
+	// object holds it, the known target stays and the existence check below
+	// fails before anything is revoked.
 	newTarget := oldTarget
 	if state.ObjectName.ValueString() == plan.ObjectName.ValueString() {
-		schema, object, qualified := strings.Cut(oldTarget, ".")
-		if current, ok := r.renames.Lookup(exasolclient.RenameSchema, schema); ok {
-			if qualified {
-				current += "." + object
+		schema, _, _ := strings.Cut(oldTarget, ".")
+		if _, renamed := r.renames.Lookup(exasolclient.RenameSchema, schema); renamed {
+			spelling := unquotedName(plan.ObjectName.ValueString())
+			found, err := objectExists(ctx, r.db, spelling)
+			if err != nil {
+				resp.Diagnostics.AddError("Check object failed", err.Error())
+				return
 			}
-			if current == unquotedName(plan.ObjectName.ValueString()) {
-				newTarget = current
+			if found {
+				newTarget = spelling
 			}
 		}
 	} else {
@@ -272,6 +276,10 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 	if oldGrantee != newGrantee || oldObjectType != newObjectType || oldTarget != newTarget ||
 		renamedAway(r.renames, exasolclient.RenamePrincipal, oldGrantee, newGrantee) ||
 		objectRenamedAway(r.renames, oldTarget, newTarget) {
+		if !requireExists(ctx, r.db, resp.Diagnostics.AddError, "Grantee", newGrantee, principalExists) ||
+			!requireExists(ctx, r.db, resp.Diagnostics.AddError, newObjectType, newTarget, objectExists) {
+			return
+		}
 		// Find where the previous privileges live now: Exasol moves them to
 		// the new name when the grantee or schema is renamed. Revoke every
 		// previous privilege there that this resource does not keep. A dropped
