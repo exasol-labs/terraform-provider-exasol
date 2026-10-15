@@ -19,7 +19,8 @@ var _ resource.ResourceWithImportState = &SchemaResource{}
 
 // SchemaResource manages Exasol schemas.
 type SchemaResource struct {
-	db *sql.DB
+	db      *sql.DB
+	renames *exasolclient.RenameLog
 }
 
 func NewSchemaResource() resource.Resource {
@@ -32,7 +33,10 @@ func (r *SchemaResource) Metadata(_ context.Context, req resource.MetadataReques
 
 func (r *SchemaResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Creates, renames and drops an Exasol schema.",
+		Description: "Creates, renames and drops an Exasol schema. " +
+			"Renaming keeps its grants: Exasol moves them to the new name. When a grant that references it changes in the same apply, " +
+			"the provider revokes the previous grant under the new name. If the rename and the grant change land in different runs " +
+			"(-target, a failed apply, another provider alias, or a rename outside Terraform), check the renamed object for leftover grants.",
 		Attributes: map[string]schema.Attribute{
 			"name": schema.StringAttribute{
 				Required:    true,
@@ -57,6 +61,7 @@ func (r *SchemaResource) Configure(_ context.Context, req resource.ConfigureRequ
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.renames = c.Renames
 	}
 }
 
@@ -194,9 +199,17 @@ func (r *SchemaResource) Update(ctx context.Context, req resource.UpdateRequest,
 	}
 
 	if oldName != newName {
+		// Hold the grant lock across RENAME and Record, so a grant Update either
+		// sees the rename in the log or revokes under the old name before it.
+		lockDelete()
 		sqlStmt := fmt.Sprintf(`RENAME SCHEMA "%s" TO "%s"`, oldName, newName)
 		tflog.Info(ctx, "Renaming schema", map[string]any{"sql": sqlStmt})
-		if _, err := r.db.ExecContext(ctx, sqlStmt); err != nil {
+		_, err := r.db.ExecContext(ctx, sqlStmt)
+		if err == nil {
+			r.renames.Record(exasolclient.RenameSchema, oldName, newName)
+		}
+		unlockDelete()
+		if err != nil {
 			resp.Diagnostics.AddError("RENAME SCHEMA failed", err.Error())
 			return
 		}

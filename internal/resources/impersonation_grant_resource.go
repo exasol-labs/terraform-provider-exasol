@@ -30,6 +30,7 @@ const (
 type ImpersonationGrantResource struct {
 	db         *sql.DB
 	targetKind impersonationTargetKind
+	renames    *exasolclient.RenameLog
 }
 
 func NewUserImpersonationGrantResource() resource.Resource {
@@ -68,6 +69,7 @@ func (r *ImpersonationGrantResource) Schema(_ context.Context, _ resource.Schema
 func (r *ImpersonationGrantResource) Configure(_ context.Context, req resource.ConfigureRequest, _ *resource.ConfigureResponse) {
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.renames = c.Renames
 	}
 }
 
@@ -139,6 +141,11 @@ func (r *ImpersonationGrantResource) Read(ctx context.Context, req resource.Read
 }
 
 func (r *ImpersonationGrantResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	// Update may REVOKE; serialize it with Delete to avoid transaction
+	// collisions (40001), see delete_mutex.go.
+	lockDelete()
+	defer unlockDelete()
+
 	var plan, state impersonationGrantModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -167,16 +174,45 @@ func (r *ImpersonationGrantResource) Update(ctx context.Context, req resource.Up
 		resp.Diagnostics.AddError("Check new impersonation grant failed", err.Error())
 		return
 	}
-	_, revoke := impersonationGrantSQL(oldGrantee, oldTarget)
-	tflog.Info(ctx, "Revoking old impersonation", map[string]any{"sql": revoke})
-	if _, err := r.db.ExecContext(ctx, revoke); err != nil {
-		resp.Diagnostics.AddError("REVOKE IMPERSONATION failed", err.Error())
+	// Find where the previous grant lives now: Exasol moves grants to the new
+	// name when the grantee or target is renamed. Revoke it there unless it is
+	// the grant this resource keeps. A dropped grantee or target took the
+	// grant with it.
+	curGrantee, granteeGone, err := resolveEndpoint(ctx, r.db, r.renames, exasolclient.RenamePrincipal, oldGrantee, newGrantee, principalExists)
+	if err != nil {
+		resp.Diagnostics.AddError("Check grantee failed", err.Error())
 		return
+	}
+	curTarget, targetGone, err := resolveEndpoint(ctx, r.db, r.renames, exasolclient.RenamePrincipal, oldTarget, newTarget, principalExists)
+	if err != nil {
+		resp.Diagnostics.AddError("Check target failed", err.Error())
+		return
+	}
+	oldGrantee, oldTarget = curGrantee, curTarget
+	oldExists := false
+	if !granteeGone && !targetGone && (oldGrantee != newGrantee || oldTarget != newTarget) {
+		oldExists, err = r.grantExists(ctx, oldGrantee, oldTarget)
+		if err != nil {
+			resp.Diagnostics.AddError("Check old impersonation grant failed", err.Error())
+			return
+		}
+	}
+	if oldExists {
+		_, revoke := impersonationGrantSQL(oldGrantee, oldTarget)
+		tflog.Info(ctx, "Revoking old impersonation", map[string]any{"sql": revoke})
+		if _, err := r.db.ExecContext(ctx, revoke); err != nil {
+			resp.Diagnostics.AddError("REVOKE IMPERSONATION failed", err.Error())
+			return
+		}
 	}
 	if !newExists {
 		grant, _ := impersonationGrantSQL(newGrantee, newTarget)
 		tflog.Info(ctx, "Granting new impersonation", map[string]any{"sql": grant})
 		if _, err := r.db.ExecContext(ctx, grant); err != nil {
+			if !oldExists {
+				resp.Diagnostics.AddError("GRANT IMPERSONATION failed", err.Error())
+				return
+			}
 			oldGrant, _ := impersonationGrantSQL(oldGrantee, oldTarget)
 			tflog.Warn(ctx, "Restoring old impersonation after failed update", map[string]any{"sql": oldGrant})
 			if _, rollbackErr := r.db.ExecContext(ctx, oldGrant); rollbackErr != nil {
@@ -207,6 +243,13 @@ func (r *ImpersonationGrantResource) Delete(ctx context.Context, req resource.De
 	}
 
 	grantee, target := r.names(state.Grantee.ValueString(), state.Target.ValueString())
+	// A grantee or target renamed in this run carries the grant to its new name.
+	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, grantee); ok {
+		grantee = current
+	}
+	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, target); ok {
+		target = current
+	}
 	exists, err := r.grantExists(ctx, grantee, target)
 	if err != nil {
 		resp.Diagnostics.AddError("Check impersonation grant failed", err.Error())

@@ -3,12 +3,12 @@
 page_title: "exasol_role Resource - terraform-provider-exasol"
 subcategory: ""
 description: |-
-  Creates, renames and drops an Exasol role. Roles are stored in UPPERCASE inside Exasol, but the 'name' attribute preserves the exact spelling from the Terraform configuration.
+  Creates, renames and drops an Exasol role. Roles are stored in UPPERCASE inside Exasol, but the 'name' attribute preserves the exact spelling from the Terraform configuration. Renaming keeps its grants: Exasol moves them to the new name. When a grant that references it changes in the same apply, the provider revokes the previous grant under the new name. If the rename and the grant change land in different runs (-target, a failed apply, another provider alias, or a rename outside Terraform), check the renamed object for leftover grants.
 ---
 
 # exasol_role (Resource)
 
-Creates, renames and drops an Exasol role. Roles are stored in UPPERCASE inside Exasol, but the 'name' attribute preserves the exact spelling from the Terraform configuration.
+Creates, renames and drops an Exasol role. Roles are stored in UPPERCASE inside Exasol, but the 'name' attribute preserves the exact spelling from the Terraform configuration. Renaming keeps its grants: Exasol moves them to the new name. When a grant that references it changes in the same apply, the provider revokes the previous grant under the new name. If the rename and the grant change land in different runs (-target, a failed apply, another provider alias, or a rename outside Terraform), check the renamed object for leftover grants.
 
 ## Example Usage
 

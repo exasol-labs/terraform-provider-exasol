@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-10-15
+
+### Changed
+- **BREAKING:** `exasol_user` no longer grants `CREATE SESSION` on create. It only runs `CREATE USER`, like Exasol itself, so login is managed in one place and can be revoked by Terraform. Users created with this version cannot log in until you add an `exasol_system_privilege` resource with `privilege = "CREATE SESSION"`. Existing users keep their grant and show no plan change. `terraform plan` shows a warning for each `exasol_user` that is about to be created
+  - Migration: before or after upgrading, add one `exasol_system_privilege` with `privilege = "CREATE SESSION"` per user that should log in (`grantee = exasol_user.<name>.name`; if your users use `for_each`, use `for_each = exasol_user.<name>` and `grantee = each.value.name`). Applying it re-grants an existing privilege, which Exasol accepts without change; alternatively import it with the ID `USER|CREATE SESSION|false`
+  - A user replaced with `-replace` or `taint` is created without `CREATE SESSION`. No warning is shown in this case, because Terraform passes the prior state to the provider
+
+### Fixed
+- Renaming a user, role, connection or schema that grants reference no longer fails in `exasol_system_privilege`, `exasol_role_grant`, `exasol_object_privilege`, `exasol_connection_grant`, `exasol_user_impersonation_grant` and `exasol_role_impersonation_grant`, and no longer leaves grants behind. Exasol moves grants to the new name itself. The provider now records the renames it executes in an apply, so the grant resources know where a previous grant lives and revoke it there when the grant changes in the same apply (another privilege, role, connection, target, object or privilege list, or another grantee). `Delete` no longer fails when the grant is already gone
+  - Limit: the provider only knows renames it executed in the same apply and provider configuration. If a rename and a change of a grant that references it land in different runs (`-target` on the renamed resource, an apply that fails between the rename and the grant update, another provider alias against the same database, or a rename outside Terraform), the previous grant can stay under the new name outside Terraform state. Exasol has no stable ID for users, roles and connections, so this cannot be detected from the database. The same applies when another object takes over the old name in the same apply (rename A to C, then B to A) and the grant moves to it without any other change: Terraform plans no update for the grant. Check the renamed object for leftover grants in these cases
+- Renames now hold the grant lock (see below), so a grant update cannot run between a rename and its record
+- `exasol_object_privilege` on a table or view (`object_name = "SCHEMA.TABLE"`) is found again on refresh. Exasol stores the schema and the object name in separate columns, so the lookup never matched: every plan wanted to create the grant again. Schema grants were not affected
+- `exasol_object_privilege`: moving an `ALL` grant to a grantee that already holds one of its privileges now grants all of them
+- `exasol_object_privilege` remembers the exact object it granted on (in private state, not visible in plans), and refresh, update and delete stay on that object. Schemas that differ only in case (`s` and `S`, which `exasol_schema` can create) are kept apart, also when one of them is dropped outside Terraform or appears later next to a target that was resolved from another spelling; only a changed `object_name` moves a grant. When the exact object is not known yet (an import, or state from 0.2.x), the exact spelling of `object_name` is tried first and its uppercase spelling second, so a lowercase spelling of an uppercase object still works. Refresh now also finds grants on lowercase schemas, which were created again on every plan before. A failed `REVOKE` during an update is now an error instead of a log warning
+- Grant updates are serialized with deletes, like deletes already were, to avoid Exasol transaction collisions (error 40001)
+
 ## [0.2.5] - 2026-09-16
 
 ### Added

@@ -210,8 +210,19 @@ func testAccCheckObjectPrivilegeDestroy(s *terraform.State) error {
 		if len(parts) < 4 {
 			continue
 		}
+		// SCHEMA.TABLE is stored as OBJECT_SCHEMA + OBJECT_NAME
+		schema, name := "", parts[3]
+		if i := strings.Index(name, "."); i >= 0 {
+			schema, name = name[:i], name[i+1:]
+		}
+		query := `SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ? AND OBJECT_TYPE = ? AND OBJECT_NAME = ?`
+		args := []any{parts[0], parts[2], name}
+		if schema != "" {
+			query += ` AND OBJECT_SCHEMA = ?`
+			args = append(args, schema)
+		}
 		var count int
-		if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ? AND OBJECT_TYPE = ? AND OBJECT_NAME = ?`, parts[0], parts[2], parts[3]).Scan(&count); err != nil {
+		if err := db.QueryRow(query, args...).Scan(&count); err != nil {
 			return err
 		}
 		if count > 0 {
@@ -414,6 +425,774 @@ resource "exasol_user" "test" {
 			},
 		},
 	})
+}
+
+// --- User: login only through an explicit CREATE SESSION grant ---
+
+func TestAccUser_NoImplicitCreateSession(t *testing.T) {
+	user := `
+resource "exasol_user" "test" {
+  name      = "ACC_USER_NO_SESSION"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}`
+	session := `
+resource "exasol_system_privilege" "session" {
+  grantee   = exasol_user.test.name
+  privilege = "CREATE SESSION"
+}`
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckUserDestroy,
+		Steps: []resource.TestStep{
+			// CREATE USER only: no system privilege, login refused
+			{
+				Config: providerConfig() + user,
+				Check:  testAccCheckUserLogin("ACC_USER_NO_SESSION", "TestPass123", false),
+			},
+			// Explicit grant: login works
+			{
+				Config: providerConfig() + user + session,
+				Check:  testAccCheckUserLogin("ACC_USER_NO_SESSION", "TestPass123", true),
+			},
+			// Grant removed: REVOKE, login refused again, user kept
+			{
+				Config: providerConfig() + user,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_user.test", "id", "ACC_USER_NO_SESSION"),
+					testAccCheckUserLogin("ACC_USER_NO_SESSION", "TestPass123", false),
+				),
+			},
+		},
+	})
+}
+
+// Renaming a user must keep every grant that references it: Exasol moves
+// privileges, role grants and impersonation rights to the new name.
+func TestAccUser_RenameWithGrants(t *testing.T) {
+	config := func(name string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_user" "u" {
+  name      = %q
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_system_privilege" "session" {
+  grantee   = exasol_user.u.name
+  privilege = "CREATE SESSION"
+}
+resource "exasol_role" "r" {
+  name = "ACC_RENAME_ROLE"
+}
+resource "exasol_role_grant" "r" {
+  role    = exasol_role.r.name
+  grantee = exasol_user.u.name
+}
+resource "exasol_schema" "s" {
+  name = "ACC_RENAME_SCHEMA"
+}
+resource "exasol_object_privilege" "s" {
+  grantee     = exasol_user.u.name
+  privileges  = ["SELECT"]
+  object_type = "SCHEMA"
+  object_name = exasol_schema.s.name
+}
+resource "exasol_connection" "c" {
+  name = "ACC_RENAME_CONN"
+  to   = "localhost:8563"
+}
+resource "exasol_connection_grant" "c" {
+  connection_name = exasol_connection.c.name
+  grantee         = exasol_user.u.name
+}
+resource "exasol_user" "other" {
+  name      = "ACC_RENAME_OTHER"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_user_impersonation_grant" "as_grantee" {
+  grantee = exasol_user.u.name
+  target  = exasol_user.other.name
+}
+resource "exasol_user_impersonation_grant" "as_target" {
+  grantee = exasol_role.r.name
+  target  = exasol_user.u.name
+}`, name)
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckUserDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("ACC_RENAME_A"),
+				Check:  testAccCheckUserLogin("ACC_RENAME_A", "TestPass123", true),
+			},
+			{
+				Config: config("ACC_RENAME_B"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("exasol_user.u", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: testAccCheckUserLogin("ACC_RENAME_B", "TestPass123", true),
+			},
+		},
+	})
+}
+
+// Renaming a role, schema and connection must keep every grant that
+// references them, as grantee, granted role, object or impersonation target.
+func TestAccRename_RoleSchemaConnection(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(suffix string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_role" "r" {
+  name = "ACC_REN_ROLE_%[1]s"
+}
+resource "exasol_role" "inner" {
+  name = "ACC_REN_INNER_%[1]s"
+}
+resource "exasol_user" "u" {
+  name      = "ACC_REN_USER"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_user" "other" {
+  name      = "ACC_REN_OTHER"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_schema" "s" {
+  name = "ACC_REN_SCHEMA_%[1]s"
+}
+resource "exasol_connection" "c" {
+  name = "ACC_REN_CONN_%[1]s"
+  to   = "localhost:8563"
+}
+resource "exasol_role_grant" "r_to_user" {
+  role    = exasol_role.r.name
+  grantee = exasol_user.u.name
+}
+resource "exasol_role_grant" "inner_to_r" {
+  role              = exasol_role.inner.name
+  grantee           = exasol_role.r.name
+  with_admin_option = true
+}
+resource "exasol_system_privilege" "r_create_table" {
+  grantee   = exasol_role.r.name
+  privilege = "CREATE TABLE"
+}
+resource "exasol_object_privilege" "r_on_schema" {
+  grantee     = exasol_role.r.name
+  privileges  = ["SELECT", "INSERT"]
+  object_type = "SCHEMA"
+  object_name = exasol_schema.s.name
+}
+resource "exasol_connection_grant" "c_to_r" {
+  connection_name = exasol_connection.c.name
+  grantee         = exasol_role.r.name
+}
+resource "exasol_user_impersonation_grant" "r_as_grantee" {
+  grantee = exasol_role.r.name
+  target  = exasol_user.other.name
+}
+resource "exasol_role_impersonation_grant" "r_as_target" {
+  grantee = exasol_user.u.name
+  target  = exasol_role.inner.name
+}`, suffix)
+	}
+	count := func(query string, want int) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			var n int
+			if err := db.QueryRow(query).Scan(&n); err != nil {
+				return fmt.Errorf("%s: %w", query, err)
+			}
+			if n != want {
+				return fmt.Errorf("%s: got %d, want %d", query, n, want)
+			}
+			return nil
+		}
+	}
+	grantsOn := func(suffix string) resource.TestCheckFunc {
+		return resource.ComposeAggregateTestCheckFunc(
+			count(fmt.Sprintf(`SELECT COUNT(*) FROM EXA_DBA_ROLE_PRIVS WHERE GRANTED_ROLE = 'ACC_REN_ROLE_%s' AND GRANTEE = 'ACC_REN_USER'`, suffix), 1),
+			count(fmt.Sprintf(`SELECT COUNT(*) FROM EXA_DBA_ROLE_PRIVS WHERE GRANTED_ROLE = 'ACC_REN_INNER_%[1]s' AND GRANTEE = 'ACC_REN_ROLE_%[1]s' AND ADMIN_OPTION IN ('TRUE', 'true', '1')`, suffix), 1),
+			count(fmt.Sprintf(`SELECT COUNT(*) FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE = 'ACC_REN_ROLE_%s' AND PRIVILEGE = 'CREATE TABLE'`, suffix), 1),
+			count(fmt.Sprintf(`SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_REN_ROLE_%[1]s' AND OBJECT_TYPE = 'SCHEMA' AND OBJECT_NAME = 'ACC_REN_SCHEMA_%[1]s'`, suffix), 2),
+			count(fmt.Sprintf(`SELECT COUNT(*) FROM EXA_DBA_CONNECTION_PRIVS WHERE GRANTED_CONNECTION = 'ACC_REN_CONN_%[1]s' AND GRANTEE = 'ACC_REN_ROLE_%[1]s'`, suffix), 1),
+			count(fmt.Sprintf(`SELECT COUNT(*) FROM EXA_DBA_IMPERSONATION_PRIVS WHERE GRANTEE = 'ACC_REN_ROLE_%s' AND IMPERSONATION_ON = 'ACC_REN_OTHER'`, suffix), 1),
+			count(fmt.Sprintf(`SELECT COUNT(*) FROM EXA_DBA_IMPERSONATION_PRIVS WHERE GRANTEE = 'ACC_REN_USER' AND IMPERSONATION_ON = 'ACC_REN_INNER_%s'`, suffix), 1),
+		)
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("A"),
+				Check:  grantsOn("A"),
+			},
+			{
+				Config: config("B"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("exasol_role.r", plancheck.ResourceActionUpdate),
+						plancheck.ExpectResourceAction("exasol_role.inner", plancheck.ResourceActionUpdate),
+						plancheck.ExpectResourceAction("exasol_schema.s", plancheck.ResourceActionUpdate),
+						plancheck.ExpectResourceAction("exasol_connection.c", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: grantsOn("B"),
+			},
+		},
+	})
+}
+
+// A rename combined with a change of the grant itself in the same apply must
+// not leave the previous grant behind on the renamed principal.
+func TestAccRename_CombinedWithGrantChange(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	type step struct{ suffix, sysPriv, role, conn, target, schema, privs string }
+	config := func(st step) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_user" "u" {
+  name      = "ACC_CMB_USER_%[1]s"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_role" "r1" {
+  name = "ACC_CMB_R1"
+}
+resource "exasol_role" "r2" {
+  name = "ACC_CMB_R2"
+}
+resource "exasol_connection" "c1" {
+  name = "ACC_CMB_C1"
+  to   = "localhost:8563"
+}
+resource "exasol_connection" "c2" {
+  name = "ACC_CMB_C2"
+  to   = "localhost:8563"
+}
+resource "exasol_user" "t1" {
+  name      = "ACC_CMB_T1"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_user" "t2" {
+  name      = "ACC_CMB_T2"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_schema" "s1" {
+  name = "ACC_CMB_S1"
+}
+resource "exasol_schema" "s2" {
+  name = "ACC_CMB_S2"
+}
+resource "exasol_system_privilege" "p" {
+  grantee   = exasol_user.u.name
+  privilege = "%[2]s"
+}
+resource "exasol_role_grant" "g" {
+  role    = exasol_role.%[3]s.name
+  grantee = exasol_user.u.name
+}
+resource "exasol_connection_grant" "c" {
+  connection_name = exasol_connection.%[4]s.name
+  grantee         = exasol_user.u.name
+}
+resource "exasol_user_impersonation_grant" "i" {
+  grantee = exasol_user.u.name
+  target  = exasol_user.%[5]s.name
+}
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_user.u.name
+  privileges  = %[7]s
+  object_type = "SCHEMA"
+  object_name = exasol_schema.%[6]s.name
+}`, st.suffix, st.sysPriv, st.role, st.conn, st.target, st.schema, st.privs)
+	}
+	// exact compares the full set of grants the renamed user holds.
+	exact := func(user string, want map[string]string) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			queries := map[string]string{
+				"sys":  `SELECT PRIVILEGE FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE = ? ORDER BY 1`,
+				"role": `SELECT GRANTED_ROLE FROM EXA_DBA_ROLE_PRIVS WHERE GRANTEE = ? ORDER BY 1`,
+				"conn": `SELECT GRANTED_CONNECTION FROM EXA_DBA_CONNECTION_PRIVS WHERE GRANTEE = ? ORDER BY 1`,
+				"imp":  `SELECT IMPERSONATION_ON FROM EXA_DBA_IMPERSONATION_PRIVS WHERE GRANTEE = ? ORDER BY 1`,
+				"obj":  `SELECT OBJECT_NAME || ':' || PRIVILEGE FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ? ORDER BY 1`,
+			}
+			for kind, q := range queries {
+				rows, err := db.Query(q, user)
+				if err != nil {
+					return err
+				}
+				var got []string
+				for rows.Next() {
+					var v string
+					if err := rows.Scan(&v); err != nil {
+						rows.Close()
+						return err
+					}
+					got = append(got, v)
+				}
+				rows.Close()
+				if g := strings.Join(got, ","); g != want[kind] {
+					return fmt.Errorf("%s grants of %s: got %q, want %q", kind, user, g, want[kind])
+				}
+			}
+			return nil
+		}
+	}
+	before := step{"A", "CREATE TABLE", "r1", "c1", "t1", "s1", `["SELECT", "INSERT"]`}
+	after := step{"B", "CREATE VIEW", "r2", "c2", "t2", "s1", `["SELECT"]`}
+	moved := step{"C", "CREATE VIEW", "r2", "c2", "t2", "s2", `["SELECT"]`}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckUserDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config(before),
+				Check: exact("ACC_CMB_USER_A", map[string]string{
+					"sys": "CREATE TABLE", "role": "ACC_CMB_R1", "conn": "ACC_CMB_C1", "imp": "ACC_CMB_T1",
+					"obj": "ACC_CMB_S1:INSERT,ACC_CMB_S1:SELECT",
+				}),
+			},
+			// Rename the user and change every grant in the same apply
+			{
+				Config: config(after),
+				Check: exact("ACC_CMB_USER_B", map[string]string{
+					"sys": "CREATE VIEW", "role": "ACC_CMB_R2", "conn": "ACC_CMB_C2", "imp": "ACC_CMB_T2",
+					"obj": "ACC_CMB_S1:SELECT",
+				}),
+			},
+			// Rename again and move the object privilege to another schema
+			{
+				Config: config(moved),
+				Check: exact("ACC_CMB_USER_C", map[string]string{
+					"sys": "CREATE VIEW", "role": "ACC_CMB_R2", "conn": "ACC_CMB_C2", "imp": "ACC_CMB_T2",
+					"obj": "ACC_CMB_S2:SELECT",
+				}),
+			},
+		},
+	})
+}
+
+// Renaming the granted side (role, connection, impersonation target, schema)
+// while switching the grantee must leave nothing on the previous grantee.
+func TestAccRename_GrantedSideWhileSwitchingGrantee(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(suffix, grantee string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_role" "u1" {
+  name = "ACC_SWP_U1"
+}
+resource "exasol_role" "u2" {
+  name = "ACC_SWP_U2"
+}
+resource "exasol_role" "r" {
+  name = "ACC_SWP_ROLE_%[1]s"
+}
+resource "exasol_connection" "c" {
+  name = "ACC_SWP_CONN_%[1]s"
+  to   = "localhost:8563"
+}
+resource "exasol_role" "target" {
+  name = "ACC_SWP_TARGET_%[1]s"
+}
+resource "exasol_schema" "s" {
+  name = "ACC_SWP_SCHEMA_%[1]s"
+}
+resource "exasol_role_grant" "g" {
+  role    = exasol_role.r.name
+  grantee = exasol_role.%[2]s.name
+}
+resource "exasol_connection_grant" "c" {
+  connection_name = exasol_connection.c.name
+  grantee         = exasol_role.%[2]s.name
+}
+resource "exasol_role_impersonation_grant" "i" {
+  grantee = exasol_role.%[2]s.name
+  target  = exasol_role.target.name
+}
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.%[2]s.name
+  privileges  = ["SELECT"]
+  object_type = "SCHEMA"
+  object_name = exasol_schema.s.name
+}`, suffix, grantee)
+	}
+	holds := func(grantee string, want int) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			var n int
+			err := db.QueryRow(`SELECT
+  (SELECT COUNT(*) FROM EXA_DBA_ROLE_PRIVS WHERE GRANTEE = ?) +
+  (SELECT COUNT(*) FROM EXA_DBA_CONNECTION_PRIVS WHERE GRANTEE = ?) +
+  (SELECT COUNT(*) FROM EXA_DBA_IMPERSONATION_PRIVS WHERE GRANTEE = ?) +
+  (SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ?)`, grantee, grantee, grantee, grantee).Scan(&n)
+			if err != nil {
+				return err
+			}
+			if n != want {
+				return fmt.Errorf("%s holds %d grants, want %d", grantee, n, want)
+			}
+			return nil
+		}
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("A", "u1"),
+				Check:  resource.ComposeAggregateTestCheckFunc(holds("ACC_SWP_U1", 4), holds("ACC_SWP_U2", 0)),
+			},
+			// Rename the granted side and switch the grantee in one apply
+			{
+				Config: config("B", "u2"),
+				Check:  resource.ComposeAggregateTestCheckFunc(holds("ACC_SWP_U1", 0), holds("ACC_SWP_U2", 4)),
+			},
+		},
+	})
+}
+
+// Switching a grant to a principal whose identical grant another resource
+// manages, while the previous grantee is renamed, must not revoke that grant.
+func TestAccRename_DoesNotRevokeOtherResourcesGrant(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(aName, p1Grantee, p1Priv string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_user" "a" {
+  name      = %q
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_user" "b" {
+  name      = "ACC_OTH_B"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_system_privilege" "p1" {
+  grantee    = exasol_user.%s.name
+  privilege  = %q
+  depends_on = [exasol_user.a]
+}
+resource "exasol_system_privilege" "p2" {
+  grantee   = exasol_user.b.name
+  privilege = "CREATE TABLE"
+}`, aName, p1Grantee, p1Priv)
+	}
+	privs := func(user, want string) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			rows, err := db.Query(`SELECT PRIVILEGE FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE = ? ORDER BY 1`, user)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			var got []string
+			for rows.Next() {
+				var v string
+				if err := rows.Scan(&v); err != nil {
+					return err
+				}
+				got = append(got, v)
+			}
+			if g := strings.Join(got, ","); g != want {
+				return fmt.Errorf("system privileges of %s: got %q, want %q", user, g, want)
+			}
+			return nil
+		}
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckUserDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("ACC_OTH_A", "a", "CREATE TABLE"),
+				Check:  resource.ComposeAggregateTestCheckFunc(privs("ACC_OTH_A", "CREATE TABLE"), privs("ACC_OTH_B", "CREATE TABLE")),
+			},
+			// Rename a and move p1 to b with another privilege: p1's moved grant
+			// is revoked on the renamed user, p2's identical grant stays on b
+			{
+				Config: config("ACC_OTH_A2", "b", "CREATE VIEW"),
+				Check:  resource.ComposeAggregateTestCheckFunc(privs("ACC_OTH_A2", ""), privs("ACC_OTH_B", "CREATE TABLE,CREATE VIEW")),
+			},
+			// Rename a again and move p1 to a third principal with the same
+			// privilege as before: nothing left on a
+			{
+				Config: config("ACC_OTH_A3", "a", "CREATE VIEW"),
+				Check:  resource.ComposeAggregateTestCheckFunc(privs("ACC_OTH_A3", "CREATE VIEW"), privs("ACC_OTH_B", "CREATE TABLE")),
+			},
+		},
+	})
+}
+
+// The previous grantee renamed to a different name than the new grantee: the
+// moved grant must be revoked on the renamed user. And an old name reused by a
+// new user in the same apply must not lose its own grant.
+func TestAccRename_ToOtherNameAndNameReuse(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	privs := func(user, want string) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			rows, err := db.Query(`SELECT PRIVILEGE FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE = ? ORDER BY 1`, user)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			var got []string
+			for rows.Next() {
+				var v string
+				if err := rows.Scan(&v); err != nil {
+					return err
+				}
+				got = append(got, v)
+			}
+			if g := strings.Join(got, ","); g != want {
+				return fmt.Errorf("system privileges of %s: got %q, want %q", user, g, want)
+			}
+			return nil
+		}
+	}
+	user := func(res, name string) string {
+		return fmt.Sprintf(`
+resource "exasol_user" "%s" {
+  name      = %q
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}`, res, name)
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckUserDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: providerConfig() + user("a", "ACC_ONR_A") + user("c", "ACC_ONR_C") + `
+resource "exasol_system_privilege" "p" {
+  grantee   = exasol_user.a.name
+  privilege = "CREATE TABLE"
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(privs("ACC_ONR_A", "CREATE TABLE"), privs("ACC_ONR_C", "")),
+			},
+			// a renamed to A2 while p moves to c with the same privilege
+			{
+				Config: providerConfig() + user("a", "ACC_ONR_A2") + user("c", "ACC_ONR_C") + `
+resource "exasol_system_privilege" "p" {
+  grantee    = exasol_user.c.name
+  privilege  = "CREATE TABLE"
+  depends_on = [exasol_user.a]
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(privs("ACC_ONR_A2", ""), privs("ACC_ONR_C", "CREATE TABLE")),
+			},
+			// p follows a back; then a is renamed away and a new user takes
+			// a's old name with a grant of its own, all in one apply
+			{
+				Config: providerConfig() + user("a", "ACC_ONR_A2") + user("c", "ACC_ONR_C") + `
+resource "exasol_system_privilege" "p" {
+  grantee   = exasol_user.a.name
+  privilege = "CREATE TABLE"
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(privs("ACC_ONR_A2", "CREATE TABLE"), privs("ACC_ONR_C", "")),
+			},
+			{
+				Config: providerConfig() + user("a", "ACC_ONR_A_OLD") + user("c", "ACC_ONR_C") + `
+resource "exasol_user" "reuse" {
+  name       = "ACC_ONR_A2"
+  auth_type  = "PASSWORD"
+  password   = "TestPass123"
+  depends_on = [exasol_user.a]
+}
+resource "exasol_system_privilege" "p" {
+  grantee   = exasol_user.a.name
+  privilege = "CREATE TABLE"
+}
+resource "exasol_system_privilege" "p_reuse" {
+  grantee   = exasol_user.reuse.name
+  privilege = "CREATE TABLE"
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(privs("ACC_ONR_A_OLD", "CREATE TABLE"), privs("ACC_ONR_A2", "CREATE TABLE")),
+			},
+		},
+	})
+}
+
+// Name swap in one apply: user a is renamed A to C, then user b B to A, and
+// the grants move from a to b (whose name is now A, the same string as before)
+// while their options change. The grants on C must be revoked. Grants with no
+// other attribute (connection, impersonation) get no plan diff in this case,
+// so Terraform never updates them: a documented limit.
+func TestAccRename_NameSwapSameConfiguredName(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(aName, bName, holder, admin, privs string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_user" "a" {
+  name      = %[1]q
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}
+resource "exasol_user" "b" {
+  name       = %[2]q
+  auth_type  = "PASSWORD"
+  password   = "TestPass123"
+  depends_on = [exasol_user.a]
+}
+resource "exasol_role" "r" {
+  name = "ACC_SWAP_ROLE"
+}
+resource "exasol_schema" "s" {
+  name = "ACC_SWAP_SCHEMA"
+}
+resource "exasol_system_privilege" "p" {
+  grantee           = exasol_user.%[3]s.name
+  privilege         = "CREATE TABLE"
+  with_admin_option = %[4]s
+}
+resource "exasol_role_grant" "g" {
+  role              = exasol_role.r.name
+  grantee           = exasol_user.%[3]s.name
+  with_admin_option = %[4]s
+}
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_user.%[3]s.name
+  privileges  = %[5]s
+  object_type = "SCHEMA"
+  object_name = exasol_schema.s.name
+}`, aName, bName, holder, admin, privs)
+	}
+	grants := func(user, want string) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			var got string
+			err := db.QueryRow(`SELECT
+  (SELECT COALESCE(GROUP_CONCAT(PRIVILEGE || ':' || ADMIN_OPTION ORDER BY PRIVILEGE), '') FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE = ?) || '|' ||
+  (SELECT COALESCE(GROUP_CONCAT(GRANTED_ROLE || ':' || ADMIN_OPTION ORDER BY GRANTED_ROLE), '') FROM EXA_DBA_ROLE_PRIVS WHERE GRANTEE = ?) || '|' ||
+  (SELECT COALESCE(GROUP_CONCAT(PRIVILEGE ORDER BY PRIVILEGE), '') FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ?)`,
+				user, user, user).Scan(&got)
+			if err != nil {
+				return err
+			}
+			got = strings.NewReplacer(":TRUE", ":true", ":FALSE", ":false", ":1", ":true", ":0", ":false").Replace(got)
+			if got != want {
+				return fmt.Errorf("grants of %s: got %q, want %q", user, got, want)
+			}
+			return nil
+		}
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckUserDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("ACC_SWAP_A", "ACC_SWAP_B", "a", "null", `["SELECT", "INSERT"]`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					grants("ACC_SWAP_A", "CREATE TABLE:false|ACC_SWAP_ROLE:false|INSERT,SELECT"),
+					grants("ACC_SWAP_B", "||"),
+				),
+			},
+			{
+				Config: config("ACC_SWAP_C", "ACC_SWAP_A", "b", "true", `["SELECT"]`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					grants("ACC_SWAP_C", "||"),
+					grants("ACC_SWAP_A", "CREATE TABLE:true|ACC_SWAP_ROLE:true|SELECT"),
+				),
+			},
+		},
+	})
+}
+
+// Renaming a lowercase schema must not affect grants on its uppercase twin:
+// quoted schema names are case-sensitive in Exasol.
+func TestAccRename_SchemaCaseTwin(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(lowerName, privs string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "upper" {
+  name = "ACC_TWIN_SCHEMA"
+}
+resource "exasol_schema" "lower" {
+  name = %q
+}
+resource "exasol_role" "r" {
+  name = "ACC_TWIN_ROLE"
+}
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "SCHEMA"
+  object_name = exasol_schema.upper.name
+  depends_on  = [exasol_schema.lower]
+}`, lowerName, privs)
+	}
+	privs := func(want string) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			var got string
+			if err := db.QueryRow(`SELECT COALESCE(GROUP_CONCAT(OBJECT_NAME || ':' || PRIVILEGE ORDER BY OBJECT_NAME, PRIVILEGE), '') FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_TWIN_ROLE'`).Scan(&got); err != nil {
+				return err
+			}
+			if got != want {
+				return fmt.Errorf("object privileges of ACC_TWIN_ROLE: got %q, want %q", got, want)
+			}
+			return nil
+		}
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("acc_twin_schema", `["SELECT", "INSERT"]`),
+				Check:  privs("ACC_TWIN_SCHEMA:INSERT,ACC_TWIN_SCHEMA:SELECT"),
+			},
+			// Rename the lowercase twin and drop INSERT on the uppercase schema
+			{
+				Config: config("acc_twin_schema2", `["SELECT"]`),
+				Check:  privs("ACC_TWIN_SCHEMA:SELECT"),
+			},
+		},
+	})
+}
+
+// testAccCheckUserLogin checks the user's direct CREATE SESSION grant and
+// whether a login with the given password succeeds.
+func testAccCheckUserLogin(user, password string, wantLogin bool) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		db := mustOpenDB()
+		defer db.Close()
+		var n int
+		if err := db.QueryRow(
+			`SELECT COUNT(*) FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE = ? AND PRIVILEGE = 'CREATE SESSION'`,
+			user).Scan(&n); err != nil {
+			return fmt.Errorf("query EXA_DBA_SYS_PRIVS: %w", err)
+		}
+		if wantLogin != (n == 1) {
+			return fmt.Errorf("user %s: %d CREATE SESSION grants, want login=%t", user, n, wantLogin)
+		}
+		userDB := openDBAs(user, password)
+		defer userDB.Close()
+		err := userDB.Ping()
+		if wantLogin && err != nil {
+			return fmt.Errorf("user %s: login failed: %w", user, err)
+		}
+		if !wantLogin && err == nil {
+			return fmt.Errorf("user %s: login succeeded without CREATE SESSION", user)
+		}
+		return nil
+	}
 }
 
 // --- Schema: create, rename, ownership, import ---
@@ -709,6 +1488,828 @@ resource "exasol_role_grant" "test" {
 
 // --- Object Privilege: grant, add privilege ---
 
+// Table grants are stored with OBJECT_SCHEMA and OBJECT_NAME split in
+// EXA_DBA_OBJ_PRIVS. Read must find them (no drift) and Delete must revoke them.
+func TestAccObjectPrivilege_OnTable(t *testing.T) {
+	db := testAccDB(t)
+	role := `
+resource "exasol_role" "test" {
+  name = "ACC_OBJTBL_ROLE"
+}`
+	grant := `
+resource "exasol_object_privilege" "test" {
+  grantee     = exasol_role.test.name
+  privileges  = ["SELECT"]
+  object_type = "TABLE"
+  object_name = "ACC_OBJTBL_SCHEMA.T1"
+}`
+	tablePrivs := func(want int) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			var n int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_OBJTBL_ROLE' AND OBJECT_SCHEMA = 'ACC_OBJTBL_SCHEMA' AND OBJECT_NAME = 'T1'`).Scan(&n); err != nil {
+				return err
+			}
+			if n != want {
+				return fmt.Errorf("table privileges for ACC_OBJTBL_ROLE: got %d, want %d", n, want)
+			}
+			return nil
+		}
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			for _, stmt := range []string{
+				`CREATE SCHEMA IF NOT EXISTS ACC_OBJTBL_SCHEMA`,
+				`CREATE OR REPLACE TABLE ACC_OBJTBL_SCHEMA.T1 (A INT)`,
+				"CREATE OR REPLACE LUA SCALAR SCRIPT ACC_OBJTBL_SCHEMA.S1() RETURNS INT AS\nfunction run(ctx) return 1 end\n/",
+			} {
+				if _, err := db.Exec(stmt); err != nil {
+					t.Fatalf("setup %q: %v", stmt, err)
+				}
+			}
+			t.Cleanup(func() {
+				_, _ = db.Exec(`DROP SCHEMA IF EXISTS ACC_OBJTBL_SCHEMA CASCADE`)
+				db.Close()
+			})
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckObjectPrivilegeDestroy,
+		Steps: []resource.TestStep{
+			// Grant on a table; the post-apply plan must be empty (no drift)
+			{
+				Config: providerConfig() + role + grant,
+				Check:  tablePrivs(1),
+			},
+			// Remove the grant only: Delete must revoke it
+			{
+				Config: providerConfig() + role,
+				Check:  tablePrivs(0),
+			},
+			// ALL on a table, EXECUTE on a script: no drift, and both revoked on removal
+			{
+				Config: providerConfig() + role + `
+resource "exasol_object_privilege" "all" {
+  grantee     = exasol_role.test.name
+  privileges  = ["ALL"]
+  object_type = "TABLE"
+  object_name = "ACC_OBJTBL_SCHEMA.T1"
+}
+resource "exasol_object_privilege" "script" {
+  grantee     = exasol_role.test.name
+  privileges  = ["EXECUTE"]
+  object_type = "SCRIPT"
+  object_name = "ACC_OBJTBL_SCHEMA.S1"
+}`,
+				Check: func(_ *terraform.State) error {
+					var n int
+					if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_OBJTBL_ROLE' AND OBJECT_SCHEMA = 'ACC_OBJTBL_SCHEMA' AND OBJECT_NAME = 'S1' AND PRIVILEGE = 'EXECUTE'`).Scan(&n); err != nil {
+						return err
+					}
+					if n != 1 {
+						return fmt.Errorf("script EXECUTE grants: got %d, want 1", n)
+					}
+					return nil
+				},
+			},
+			{
+				Config: providerConfig() + role,
+				Check: func(_ *terraform.State) error {
+					var n int
+					if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_OBJTBL_ROLE'`).Scan(&n); err != nil {
+						return err
+					}
+					if n != 0 {
+						return fmt.Errorf("object privileges left for ACC_OBJTBL_ROLE: %d", n)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// Exasol expands ALL into one row per privilege. Moving an ALL grant to a
+// grantee that already holds one of those privileges must still grant ALL.
+func TestAccObjectPrivilege_AllToGranteeWithPartialPrivileges(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(grantee string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "s" {
+  name = "ACC_OBJALL_SCHEMA"
+}
+resource "exasol_role" "rx" {
+  name = "ACC_OBJALL_RX"
+}
+resource "exasol_role" "ra" {
+  name = "ACC_OBJALL_RA"
+}
+resource "exasol_object_privilege" "all" {
+  grantee     = exasol_role.%s.name
+  privileges  = ["ALL"]
+  object_type = "SCHEMA"
+  object_name = exasol_schema.s.name
+}`, grantee)
+	}
+	privCount := func(grantee string) (int, error) {
+		var n int
+		err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ? AND OBJECT_TYPE = 'SCHEMA' AND OBJECT_NAME = 'ACC_OBJALL_SCHEMA'`, grantee).Scan(&n)
+		return n, err
+	}
+	var allRows int
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckObjectPrivilegeDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("rx"),
+				Check: func(_ *terraform.State) error {
+					n, err := privCount("ACC_OBJALL_RX")
+					if err != nil {
+						return err
+					}
+					if n < 2 {
+						return fmt.Errorf("ALL on schema expanded to %d rows, want at least 2", n)
+					}
+					allRows = n
+					return nil
+				},
+			},
+			{
+				PreConfig: func() {
+					if _, err := db.Exec(`GRANT SELECT ON SCHEMA ACC_OBJALL_SCHEMA TO ACC_OBJALL_RA`); err != nil {
+						t.Fatalf("grant outside Terraform: %v", err)
+					}
+				},
+				Config: config("ra"),
+				Check: func(_ *terraform.State) error {
+					ra, err := privCount("ACC_OBJALL_RA")
+					if err != nil {
+						return err
+					}
+					rx, err := privCount("ACC_OBJALL_RX")
+					if err != nil {
+						return err
+					}
+					if ra != allRows || rx != 0 {
+						return fmt.Errorf("after moving ALL: RA holds %d (want %d), RX holds %d (want 0)", ra, allRows, rx)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// Moving a grant WITH ADMIN OPTION to a grantee that already holds it without
+// admin option must end with the admin option set.
+func TestAccGrant_MoveToGranteeWithoutAdminOption(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(grantee string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_role" "granted" {
+  name = "ACC_ADMMOVE_GRANTED"
+}
+resource "exasol_role" "rx" {
+  name = "ACC_ADMMOVE_RX"
+}
+resource "exasol_role" "ra" {
+  name = "ACC_ADMMOVE_RA"
+}
+resource "exasol_role_grant" "g" {
+  role              = exasol_role.granted.name
+  grantee           = exasol_role.%[1]s.name
+  with_admin_option = true
+}
+resource "exasol_system_privilege" "p" {
+  grantee           = exasol_role.%[1]s.name
+  privilege         = "CREATE TABLE"
+  with_admin_option = true
+}`, grantee)
+	}
+	adminRows := func(want int) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			for _, q := range []string{
+				`SELECT COUNT(*) FROM EXA_DBA_ROLE_PRIVS WHERE GRANTED_ROLE = 'ACC_ADMMOVE_GRANTED' AND GRANTEE = 'ACC_ADMMOVE_RA' AND ADMIN_OPTION IN ('TRUE', 'true', '1')`,
+				`SELECT COUNT(*) FROM EXA_DBA_SYS_PRIVS WHERE PRIVILEGE = 'CREATE TABLE' AND GRANTEE = 'ACC_ADMMOVE_RA' AND ADMIN_OPTION IN ('TRUE', 'true', '1')`,
+			} {
+				var n int
+				if err := db.QueryRow(q).Scan(&n); err != nil {
+					return err
+				}
+				if n != want {
+					return fmt.Errorf("%s: got %d, want %d", q, n, want)
+				}
+			}
+			return nil
+		}
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("rx"),
+				Check:  adminRows(0),
+			},
+			{
+				PreConfig: func() {
+					for _, stmt := range []string{
+						`GRANT ACC_ADMMOVE_GRANTED TO ACC_ADMMOVE_RA`,
+						`GRANT CREATE TABLE TO ACC_ADMMOVE_RA`,
+					} {
+						if _, err := db.Exec(stmt); err != nil {
+							t.Fatalf("grant outside Terraform %q: %v", stmt, err)
+						}
+					}
+				},
+				Config: config("ra"),
+				Check:  adminRows(1),
+			},
+		},
+	})
+}
+
+// An object name stored in lowercase (e.g. by an import) must not make every
+// later apply fail on REVOKE: lookups and REVOKE use the same uppercase name.
+func TestAccObjectPrivilege_LowercaseNameInState(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	base := providerConfig() + `
+resource "exasol_schema" "s" {
+  name = "ACC_LCO_SCHEMA"
+}
+resource "exasol_role" "r" {
+  name = "ACC_LCO_ROLE"
+}`
+	grant := `
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.r.name
+  privileges  = ["USAGE"]
+  object_type = "SCHEMA"
+  object_name = exasol_schema.s.name
+}`
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckObjectPrivilegeDestroy,
+		Steps: []resource.TestStep{
+			{Config: base},
+			// Grant outside Terraform, import it with a lowercase object name
+			{
+				PreConfig: func() {
+					if _, err := db.Exec(`GRANT USAGE ON SCHEMA ACC_LCO_SCHEMA TO ACC_LCO_ROLE`); err != nil {
+						t.Fatalf("grant outside Terraform: %v", err)
+					}
+				},
+				Config:             base + grant,
+				ResourceName:       "exasol_object_privilege.o",
+				ImportState:        true,
+				ImportStateId:      "ACC_LCO_ROLE|USAGE|SCHEMA|acc_lco_schema",
+				ImportStatePersist: true,
+			},
+			// The case-only difference is applied without a REVOKE error, and
+			// the grant is still there afterwards
+			{
+				Config: base + grant,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_object_privilege.o", "object_name", "ACC_LCO_SCHEMA"),
+					func(_ *terraform.State) error {
+						var n int
+						if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_LCO_ROLE' AND OBJECT_NAME = 'ACC_LCO_SCHEMA' AND PRIVILEGE = 'USAGE'`).Scan(&n); err != nil {
+							return err
+						}
+						if n != 1 {
+							return fmt.Errorf("USAGE grants after case-only update: got %d, want 1", n)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// Same, for the branch where only the privilege list changes: state and
+// configuration both keep the lowercase name, and the removed privilege must
+// really be revoked.
+func TestAccObjectPrivilege_LowercaseNamePrivilegeRemoval(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	base := providerConfig() + `
+resource "exasol_schema" "s" {
+  name = "ACC_LCR_SCHEMA"
+}
+resource "exasol_role" "r" {
+  name = "ACC_LCR_ROLE"
+}`
+	grant := func(privs string) string {
+		return fmt.Sprintf(`
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "SCHEMA"
+  object_name = "acc_lcr_schema"
+  depends_on  = [exasol_schema.s]
+}`, privs)
+	}
+	privs := func(want string) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			var got string
+			if err := db.QueryRow(`SELECT COALESCE(GROUP_CONCAT(PRIVILEGE ORDER BY PRIVILEGE), '') FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_LCR_ROLE'`).Scan(&got); err != nil {
+				return err
+			}
+			if got != want {
+				return fmt.Errorf("object privileges of ACC_LCR_ROLE: got %q, want %q", got, want)
+			}
+			return nil
+		}
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckObjectPrivilegeDestroy,
+		Steps: []resource.TestStep{
+			{Config: base},
+			// Grant outside Terraform, import with a lowercase object name
+			{
+				PreConfig: func() {
+					for _, stmt := range []string{
+						`GRANT SELECT ON SCHEMA ACC_LCR_SCHEMA TO ACC_LCR_ROLE`,
+						`GRANT INSERT ON SCHEMA ACC_LCR_SCHEMA TO ACC_LCR_ROLE`,
+					} {
+						if _, err := db.Exec(stmt); err != nil {
+							t.Fatalf("grant outside Terraform %q: %v", stmt, err)
+						}
+					}
+				},
+				Config:             base + grant(`["SELECT", "INSERT"]`),
+				ResourceName:       "exasol_object_privilege.o",
+				ImportState:        true,
+				ImportStateId:      "ACC_LCR_ROLE|SELECT,INSERT|SCHEMA|acc_lcr_schema",
+				ImportStatePersist: true,
+			},
+			// Remove INSERT; the name stays lowercase in state and config
+			{
+				Config: base + grant(`["SELECT"]`),
+				Check:  privs("SELECT"),
+			},
+		},
+	})
+}
+
+// Grants on case twins "acc_ctw_schema" and "ACC_CTW_SCHEMA" are separate:
+// refresh, privilege removal, deletion and moving a grant each touch only the
+// configured schema.
+func TestAccObjectPrivilege_CaseTwinGrants(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(lowerGrant, upperTarget, upperPrivs string) string {
+		return providerConfig() + `
+resource "exasol_schema" "upper" {
+  name = "ACC_CTW_SCHEMA"
+}
+resource "exasol_schema" "lower" {
+  name = "acc_ctw_schema"
+}
+resource "exasol_role" "r" {
+  name = "ACC_CTW_ROLE"
+}
+resource "exasol_object_privilege" "up" {
+  grantee     = exasol_role.r.name
+  privileges  = ` + upperPrivs + `
+  object_type = "SCHEMA"
+  object_name = exasol_schema.` + upperTarget + `.name
+}` + lowerGrant
+	}
+	lowerGrant := func(privs string) string {
+		return `
+resource "exasol_object_privilege" "low" {
+  grantee     = exasol_role.r.name
+  privileges  = ` + privs + `
+  object_type = "SCHEMA"
+  object_name = exasol_schema.lower.name
+}`
+	}
+	privs := func(schema, want string) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			// Exasol treats '' as NULL, so no rows yield NULL here
+			var got sql.NullString
+			if err := db.QueryRow(`SELECT GROUP_CONCAT(PRIVILEGE ORDER BY PRIVILEGE) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_CTW_ROLE' AND OBJECT_NAME = ?`, schema).Scan(&got); err != nil {
+				return err
+			}
+			if got.String != want {
+				return fmt.Errorf("privileges on %s: got %q, want %q", schema, got.String, want)
+			}
+			return nil
+		}
+	}
+	both := `["SELECT", "INSERT"]`
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			// Grants on both twins; the refresh plan must be empty
+			{
+				Config: config(lowerGrant(both), "upper", both),
+				Check:  resource.ComposeAggregateTestCheckFunc(privs("acc_ctw_schema", "INSERT,SELECT"), privs("ACC_CTW_SCHEMA", "INSERT,SELECT")),
+			},
+			// Remove INSERT on the lowercase twin only
+			{
+				Config: config(lowerGrant(`["SELECT"]`), "upper", both),
+				Check:  resource.ComposeAggregateTestCheckFunc(privs("acc_ctw_schema", "SELECT"), privs("ACC_CTW_SCHEMA", "INSERT,SELECT")),
+			},
+			// Delete the lowercase twin's grant
+			{
+				Config: config("", "upper", both),
+				Check:  resource.ComposeAggregateTestCheckFunc(privs("acc_ctw_schema", ""), privs("ACC_CTW_SCHEMA", "INSERT,SELECT")),
+			},
+			// Move the uppercase grant to the lowercase twin
+			{
+				Config: config("", "lower", both),
+				Check:  resource.ComposeAggregateTestCheckFunc(privs("acc_ctw_schema", "INSERT,SELECT"), privs("ACC_CTW_SCHEMA", "")),
+			},
+		},
+	})
+}
+
+// A table grant follows a schema rename in the same apply: the previous
+// privilege removed from the list is revoked on the renamed schema's table.
+func TestAccObjectPrivilege_TableAfterSchemaRename(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(schema, privs string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "s" {
+  name = %q
+}
+resource "exasol_role" "r" {
+  name = "ACC_TSR_ROLE"
+}
+resource "exasol_object_privilege" "t" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "TABLE"
+  object_name = "${exasol_schema.s.name}.T1"
+}`, schema, privs)
+	}
+	privs := func(schema, want string) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			var got sql.NullString
+			if err := db.QueryRow(`SELECT GROUP_CONCAT(PRIVILEGE ORDER BY PRIVILEGE) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = 'ACC_TSR_ROLE' AND OBJECT_SCHEMA = ? AND OBJECT_NAME = 'T1'`, schema).Scan(&got); err != nil {
+				return err
+			}
+			if got.String != want {
+				return fmt.Errorf("privileges on %s.T1: got %q, want %q", schema, got.String, want)
+			}
+			return nil
+		}
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: providerConfig() + `
+resource "exasol_schema" "s" {
+  name = "ACC_TSR_SCHEMA"
+}`,
+				Check: func(_ *terraform.State) error {
+					_, err := db.Exec(`CREATE TABLE ACC_TSR_SCHEMA.T1 (A INT)`)
+					return err
+				},
+			},
+			{
+				Config: config("ACC_TSR_SCHEMA", `["SELECT", "INSERT"]`),
+				Check:  privs("ACC_TSR_SCHEMA", "INSERT,SELECT"),
+			},
+			// Rename the schema and drop INSERT in the same apply
+			{
+				Config: config("ACC_TSR_SCHEMA2", `["SELECT"]`),
+				Check:  resource.ComposeAggregateTestCheckFunc(privs("ACC_TSR_SCHEMA2", "SELECT"), privs("ACC_TSR_SCHEMA", "")),
+			},
+		},
+	})
+}
+
+// objPrivs returns a check that the privileges of role on schema (exact name)
+// are want, comma-separated and sorted.
+func objPrivs(db *sql.DB, role, schema, want string) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		// Exasol treats '' as NULL, so no rows yield NULL here
+		var got sql.NullString
+		if err := db.QueryRow(`SELECT GROUP_CONCAT(PRIVILEGE ORDER BY PRIVILEGE) FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = ? AND OBJECT_NAME = ? AND OBJECT_TYPE = 'SCHEMA'`, role, schema).Scan(&got); err != nil {
+			return err
+		}
+		if got.String != want {
+			return fmt.Errorf("privileges of %s on %s: got %q, want %q", role, schema, got.String, want)
+		}
+		return nil
+	}
+}
+
+// Twin schemas "acc_tdr_s" and "ACC_TDR_S" have identical grants. When the
+// lowercase twin is dropped outside Terraform, refresh must not switch its
+// grant resource over to the uppercase twin, and removing that resource must
+// not revoke the uppercase twin's grant.
+func TestAccObjectPrivilege_DroppedTwinKeepsOtherTwin(t *testing.T) {
+	db := testAccDB(t)
+	grant := func(res, schema string) string {
+		return fmt.Sprintf(`
+resource "exasol_object_privilege" %q {
+  grantee     = exasol_role.r.name
+  privileges  = ["SELECT", "INSERT"]
+  object_type = "SCHEMA"
+  object_name = %q
+}`, res, schema)
+	}
+	role := providerConfig() + `
+resource "exasol_role" "r" {
+  name = "ACC_TDR_ROLE"
+}`
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			for _, stmt := range []string{`CREATE SCHEMA IF NOT EXISTS "acc_tdr_s"`, `CREATE SCHEMA IF NOT EXISTS "ACC_TDR_S"`} {
+				if _, err := db.Exec(stmt); err != nil {
+					t.Fatalf("setup %q: %v", stmt, err)
+				}
+			}
+			t.Cleanup(func() {
+				_, _ = db.Exec(`DROP SCHEMA IF EXISTS "acc_tdr_s" CASCADE`)
+				_, _ = db.Exec(`DROP SCHEMA IF EXISTS "ACC_TDR_S" CASCADE`)
+				db.Close()
+			})
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: role + grant("low", "acc_tdr_s") + grant("up", "ACC_TDR_S"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					objPrivs(db, "ACC_TDR_ROLE", "acc_tdr_s", "INSERT,SELECT"),
+					objPrivs(db, "ACC_TDR_ROLE", "ACC_TDR_S", "INSERT,SELECT"),
+				),
+			},
+			// Drop the lowercase twin outside Terraform and remove its resource
+			{
+				PreConfig: func() {
+					if _, err := db.Exec(`DROP SCHEMA "acc_tdr_s" CASCADE`); err != nil {
+						t.Fatalf("drop outside Terraform: %v", err)
+					}
+				},
+				Config: role + grant("up", "ACC_TDR_S"),
+				Check:  objPrivs(db, "ACC_TDR_ROLE", "ACC_TDR_S", "INSERT,SELECT"),
+			},
+		},
+	})
+}
+
+// A grant imported with a lowercase spelling of an uppercase schema follows
+// a rename of that schema in the same apply as a privilege change.
+func TestAccObjectPrivilege_ImportedSpellingThenSchemaRename(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(schema, privs string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "s" {
+  name = %q
+}
+resource "exasol_role" "r" {
+  name = "ACC_ISR_ROLE"
+}
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "SCHEMA"
+  object_name = exasol_schema.s.name
+}`, schema, privs)
+	}
+	base := providerConfig() + `
+resource "exasol_schema" "s" {
+  name = "ACC_ISR_OLD"
+}
+resource "exasol_role" "r" {
+  name = "ACC_ISR_ROLE"
+}`
+	both := `["SELECT", "INSERT"]`
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{Config: base},
+			{
+				PreConfig: func() {
+					for _, stmt := range []string{
+						`GRANT SELECT ON SCHEMA ACC_ISR_OLD TO ACC_ISR_ROLE`,
+						`GRANT INSERT ON SCHEMA ACC_ISR_OLD TO ACC_ISR_ROLE`,
+					} {
+						if _, err := db.Exec(stmt); err != nil {
+							t.Fatalf("grant outside Terraform %q: %v", stmt, err)
+						}
+					}
+				},
+				Config:             config("ACC_ISR_OLD", both),
+				ResourceName:       "exasol_object_privilege.o",
+				ImportState:        true,
+				ImportStateId:      "ACC_ISR_ROLE|SELECT,INSERT|SCHEMA|acc_isr_old",
+				ImportStatePersist: true,
+			},
+			// Rename the schema and drop INSERT in the same apply
+			{
+				Config: config("ACC_ISR_NEW", `["SELECT"]`),
+				Check:  objPrivs(db, "ACC_ISR_ROLE", "ACC_ISR_NEW", "SELECT"),
+			},
+		},
+	})
+}
+
+// A grant imported with the spelling "acc_tai_s" for schema ACC_TAI_S stays
+// on ACC_TAI_S when a separate schema "acc_tai_s" appears later and only the
+// privileges change.
+func TestAccObjectPrivilege_CaseTwinAppearsAfterImport(t *testing.T) {
+	db := testAccDB(t)
+	base := providerConfig() + `
+resource "exasol_role" "r" {
+  name = "ACC_TAI_ROLE"
+}`
+	grant := func(privs string) string {
+		return fmt.Sprintf(`
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "SCHEMA"
+  object_name = "acc_tai_s"
+}`, privs)
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			if _, err := db.Exec(`CREATE SCHEMA IF NOT EXISTS ACC_TAI_S`); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+			t.Cleanup(func() {
+				_, _ = db.Exec(`DROP SCHEMA IF EXISTS "acc_tai_s" CASCADE`)
+				_, _ = db.Exec(`DROP SCHEMA IF EXISTS ACC_TAI_S CASCADE`)
+				db.Close()
+			})
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{Config: base},
+			{
+				PreConfig: func() {
+					if _, err := db.Exec(`GRANT SELECT ON SCHEMA ACC_TAI_S TO ACC_TAI_ROLE`); err != nil {
+						t.Fatalf("grant outside Terraform: %v", err)
+					}
+				},
+				Config:             base + grant(`["SELECT"]`),
+				ResourceName:       "exasol_object_privilege.o",
+				ImportState:        true,
+				ImportStateId:      "ACC_TAI_ROLE|SELECT|SCHEMA|acc_tai_s",
+				ImportStatePersist: true,
+			},
+			// Refresh resolves and remembers ACC_TAI_S
+			{
+				Config: base + grant(`["SELECT"]`),
+				Check:  objPrivs(db, "ACC_TAI_ROLE", "ACC_TAI_S", "SELECT"),
+			},
+			// The lowercase twin appears; only the privileges change
+			{
+				PreConfig: func() {
+					if _, err := db.Exec(`CREATE SCHEMA "acc_tai_s"`); err != nil {
+						t.Fatalf("create twin: %v", err)
+					}
+				},
+				Config: base + grant(`["SELECT", "INSERT"]`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					objPrivs(db, "ACC_TAI_ROLE", "ACC_TAI_S", "INSERT,SELECT"),
+					objPrivs(db, "ACC_TAI_ROLE", "acc_tai_s", ""),
+				),
+			},
+		},
+	})
+}
+
+// Schema swap with an unchanged spelling: schema a is renamed S to S2, then
+// schema b B to S, and the grant moves from a to b while dropping INSERT.
+// object_name stays "ACC_SWS_S", but it names schema b now.
+func TestAccObjectPrivilege_SchemaSwapSameSpelling(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(aName, bName, holder, privs string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "a" {
+  name = %q
+}
+resource "exasol_schema" "b" {
+  name       = %q
+  depends_on = [exasol_schema.a]
+}
+resource "exasol_role" "r" {
+  name = "ACC_SWS_ROLE"
+}
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "SCHEMA"
+  object_name = exasol_schema.%s.name
+}`, aName, bName, privs, holder)
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("ACC_SWS_S", "ACC_SWS_B", "a", `["SELECT", "INSERT"]`),
+				Check:  objPrivs(db, "ACC_SWS_ROLE", "ACC_SWS_S", "INSERT,SELECT"),
+			},
+			{
+				Config: config("ACC_SWS_S2", "ACC_SWS_S", "b", `["SELECT"]`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					objPrivs(db, "ACC_SWS_ROLE", "ACC_SWS_S2", ""),
+					objPrivs(db, "ACC_SWS_ROLE", "ACC_SWS_S", "SELECT"),
+				),
+			},
+		},
+	})
+}
+
+// An imported spelling "acc_crs" resolved to schema ACC_CRS; the schema is then
+// renamed to exactly that spelling while INSERT is dropped. The grant must end
+// up on the renamed schema with SELECT only.
+func TestAccObjectPrivilege_RenameToImportedSpelling(t *testing.T) {
+	db := testAccDB(t)
+	t.Cleanup(func() { db.Close() })
+	config := func(schema, privs string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "s" {
+  name = %q
+}
+resource "exasol_role" "r" {
+  name = "ACC_CRS_ROLE"
+}
+resource "exasol_object_privilege" "o" {
+  grantee     = exasol_role.r.name
+  privileges  = %s
+  object_type = "SCHEMA"
+  object_name = "acc_crs"
+  depends_on  = [exasol_schema.s]
+}`, schema, privs)
+	}
+	base := providerConfig() + `
+resource "exasol_schema" "s" {
+  name = "ACC_CRS"
+}
+resource "exasol_role" "r" {
+  name = "ACC_CRS_ROLE"
+}`
+	both := `["SELECT", "INSERT"]`
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckRoleDestroy,
+		Steps: []resource.TestStep{
+			{Config: base},
+			{
+				PreConfig: func() {
+					for _, stmt := range []string{
+						`GRANT SELECT ON SCHEMA ACC_CRS TO ACC_CRS_ROLE`,
+						`GRANT INSERT ON SCHEMA ACC_CRS TO ACC_CRS_ROLE`,
+					} {
+						if _, err := db.Exec(stmt); err != nil {
+							t.Fatalf("grant outside Terraform %q: %v", stmt, err)
+						}
+					}
+				},
+				Config:             config("ACC_CRS", both),
+				ResourceName:       "exasol_object_privilege.o",
+				ImportState:        true,
+				ImportStateId:      "ACC_CRS_ROLE|SELECT,INSERT|SCHEMA|acc_crs",
+				ImportStatePersist: true,
+			},
+			// Refresh remembers ACC_CRS
+			{
+				Config: config("ACC_CRS", both),
+				Check:  objPrivs(db, "ACC_CRS_ROLE", "ACC_CRS", "INSERT,SELECT"),
+			},
+			// Rename ACC_CRS to "acc_crs" and drop INSERT in the same apply
+			{
+				Config: config("acc_crs", `["SELECT"]`),
+				Check:  objPrivs(db, "ACC_CRS_ROLE", "acc_crs", "SELECT"),
+			},
+		},
+	})
+}
+
 func TestAccObjectPrivilege_OnSchema(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -797,6 +2398,10 @@ resource "exasol_user" "login" {
   auth_type = "PASSWORD"
   password  = "login-password"
 }
+resource "exasol_system_privilege" "login_session" {
+  grantee   = exasol_user.login.name
+  privilege = "CREATE SESSION"
+}
 resource "exasol_role_grant" "grantee_to_login" {
   role    = exasol_role.grantee.name
   grantee = exasol_user.login.name
@@ -846,6 +2451,10 @@ resource "exasol_user" "login" {
   name      = "ACC_IMPERSONATION_LOGIN"
   auth_type = "PASSWORD"
   password  = "login-password"
+}
+resource "exasol_system_privilege" "login_session" {
+  grantee   = exasol_user.login.name
+  privilege = "CREATE SESSION"
 }
 resource "exasol_role_grant" "grantee_to_login" {
   role    = exasol_role.grantee.name

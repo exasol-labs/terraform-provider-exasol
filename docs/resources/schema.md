@@ -3,12 +3,12 @@
 page_title: "exasol_schema Resource - terraform-provider-exasol"
 subcategory: ""
 description: |-
-  Creates, renames and drops an Exasol schema.
+  Creates, renames and drops an Exasol schema. Renaming keeps its grants: Exasol moves them to the new name. When a grant that references it changes in the same apply, the provider revokes the previous grant under the new name. If the rename and the grant change land in different runs (-target, a failed apply, another provider alias, or a rename outside Terraform), check the renamed object for leftover grants.
 ---
 
 # exasol_schema (Resource)
 
-Creates, renames and drops an Exasol schema.
+Creates, renames and drops an Exasol schema. Renaming keeps its grants: Exasol moves them to the new name. When a grant that references it changes in the same apply, the provider revokes the previous grant under the new name. If the rename and the grant change land in different runs (-target, a failed apply, another provider alias, or a rename outside Terraform), check the renamed object for leftover grants.
 
 ## Example Usage
 
