@@ -416,6 +416,75 @@ resource "exasol_user" "test" {
 	})
 }
 
+// --- User: login only through an explicit CREATE SESSION grant ---
+
+func TestAccUser_NoImplicitCreateSession(t *testing.T) {
+	user := `
+resource "exasol_user" "test" {
+  name      = "ACC_USER_NO_SESSION"
+  auth_type = "PASSWORD"
+  password  = "TestPass123"
+}`
+	session := `
+resource "exasol_system_privilege" "session" {
+  grantee   = exasol_user.test.name
+  privilege = "CREATE SESSION"
+}`
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckUserDestroy,
+		Steps: []resource.TestStep{
+			// CREATE USER only: no system privilege, login refused
+			{
+				Config: providerConfig() + user,
+				Check:  testAccCheckUserLogin("ACC_USER_NO_SESSION", "TestPass123", false),
+			},
+			// Explicit grant: login works
+			{
+				Config: providerConfig() + user + session,
+				Check:  testAccCheckUserLogin("ACC_USER_NO_SESSION", "TestPass123", true),
+			},
+			// Grant removed: REVOKE, login refused again, user kept
+			{
+				Config: providerConfig() + user,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_user.test", "id", "ACC_USER_NO_SESSION"),
+					testAccCheckUserLogin("ACC_USER_NO_SESSION", "TestPass123", false),
+				),
+			},
+		},
+	})
+}
+
+// testAccCheckUserLogin checks the user's direct CREATE SESSION grant and
+// whether a login with the given password succeeds.
+func testAccCheckUserLogin(user, password string, wantLogin bool) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		db := mustOpenDB()
+		defer db.Close()
+		var n int
+		if err := db.QueryRow(
+			`SELECT COUNT(*) FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE = ? AND PRIVILEGE = 'CREATE SESSION'`,
+			user).Scan(&n); err != nil {
+			return fmt.Errorf("query EXA_DBA_SYS_PRIVS: %w", err)
+		}
+		if wantLogin != (n == 1) {
+			return fmt.Errorf("user %s: %d CREATE SESSION grants, want login=%t", user, n, wantLogin)
+		}
+		userDB := openDBAs(user, password)
+		defer userDB.Close()
+		err := userDB.Ping()
+		if wantLogin && err != nil {
+			return fmt.Errorf("user %s: login failed: %w", user, err)
+		}
+		if !wantLogin && err == nil {
+			return fmt.Errorf("user %s: login succeeded without CREATE SESSION", user)
+		}
+		return nil
+	}
+}
+
 // --- Schema: create, rename, ownership, import ---
 
 func TestAccSchema_FullLifecycle(t *testing.T) {
@@ -797,6 +866,10 @@ resource "exasol_user" "login" {
   auth_type = "PASSWORD"
   password  = "login-password"
 }
+resource "exasol_system_privilege" "login_session" {
+  grantee   = exasol_user.login.name
+  privilege = "CREATE SESSION"
+}
 resource "exasol_role_grant" "grantee_to_login" {
   role    = exasol_role.grantee.name
   grantee = exasol_user.login.name
@@ -846,6 +919,10 @@ resource "exasol_user" "login" {
   name      = "ACC_IMPERSONATION_LOGIN"
   auth_type = "PASSWORD"
   password  = "login-password"
+}
+resource "exasol_system_privilege" "login_session" {
+  grantee   = exasol_user.login.name
+  privilege = "CREATE SESSION"
 }
 resource "exasol_role_grant" "grantee_to_login" {
   role    = exasol_role.grantee.name

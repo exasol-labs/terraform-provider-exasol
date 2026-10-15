@@ -3,12 +3,12 @@
 page_title: "exasol_user Resource - terraform-provider-exasol"
 subcategory: ""
 description: |-
-  Creates, updates (rename / change auth) and drops an Exasol user.
+  Creates, updates (rename / change auth) and drops an Exasol user. Like Exasol's CREATE USER, it grants no privileges: grant CREATE SESSION with exasol_system_privilege so the user can log in.
 ---
 
 # exasol_user (Resource)
 
-Creates, updates (rename / change auth) and drops an Exasol user.
+Creates, updates (rename / change auth) and drops an Exasol user. Like Exasol's CREATE USER, it grants no privileges: grant CREATE SESSION with exasol_system_privilege so the user can log in.
 
 ## Example Usage
 
@@ -18,6 +18,13 @@ resource "exasol_user" "analyst" {
   name      = "ANALYST_USER"
   auth_type = "PASSWORD"
   password  = var.analyst_password
+}
+
+# exasol_user grants no privileges, like Exasol's CREATE USER.
+# Grant CREATE SESSION explicitly so the user can log in.
+resource "exasol_system_privilege" "analyst_login" {
+  grantee   = exasol_user.analyst.name
+  privilege = "CREATE SESSION"
 }
 
 # LDAP authentication
