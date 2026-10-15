@@ -3,12 +3,12 @@
 page_title: "exasol_user Resource - terraform-provider-exasol"
 subcategory: ""
 description: |-
-  Creates, updates (rename / change auth) and drops an Exasol user. Like Exasol's CREATE USER, it grants no privileges: grant CREATE SESSION with exasol_system_privilege so the user can log in.
+  Creates, updates (rename / change auth) and drops an Exasol user. Like Exasol's CREATE USER, it grants no privileges: grant CREATE SESSION with exasol_system_privilege so the user can log in. Renaming keeps its grants: Exasol moves them to the new name. When a grant that references it changes in the same apply, the provider revokes the previous grant under the new name. If the rename and the grant change land in different runs (-target, a failed apply, another provider alias, or a rename outside Terraform), check the renamed object for leftover grants.
 ---
 
 # exasol_user (Resource)
 
-Creates, updates (rename / change auth) and drops an Exasol user. Like Exasol's CREATE USER, it grants no privileges: grant CREATE SESSION with exasol_system_privilege so the user can log in.
+Creates, updates (rename / change auth) and drops an Exasol user. Like Exasol's CREATE USER, it grants no privileges: grant CREATE SESSION with exasol_system_privilege so the user can log in. Renaming keeps its grants: Exasol moves them to the new name. When a grant that references it changes in the same apply, the provider revokes the previous grant under the new name. If the rename and the grant change land in different runs (-target, a failed apply, another provider alias, or a rename outside Terraform), check the renamed object for leftover grants.
 
 ## Example Usage
 

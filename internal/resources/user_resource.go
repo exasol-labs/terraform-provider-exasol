@@ -36,7 +36,10 @@ func (r *UserResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 	resp.Schema = schema.Schema{
 		Description: "Creates, updates (rename / change auth) and drops an Exasol user. " +
 			"Like Exasol's CREATE USER, it grants no privileges: grant CREATE SESSION with " +
-			"exasol_system_privilege so the user can log in.",
+			"exasol_system_privilege so the user can log in. " +
+			"Renaming keeps its grants: Exasol moves them to the new name. When a grant that references it changes in the same apply, " +
+			"the provider revokes the previous grant under the new name. If the rename and the grant change land in different runs " +
+			"(-target, a failed apply, another provider alias, or a rename outside Terraform), check the renamed object for leftover grants.",
 		Attributes: map[string]schema.Attribute{
 			"name": schema.StringAttribute{
 				Required:    true,
@@ -220,13 +223,20 @@ func (r *UserResource) Update(ctx context.Context, req resource.UpdateRequest, r
 	escapedNew := escapeIdentifierLiteral(upNew)
 
 	if upOld != upNew {
+		// Hold the grant lock across RENAME and Record, so a grant Update either
+		// sees the rename in the log or revokes under the old name before it.
+		lockDelete()
 		stmt := fmt.Sprintf(`RENAME USER "%s" TO "%s"`, escapedOld, escapedNew)
 		tflog.Info(ctx, "Renaming user", map[string]any{"sql": stmt})
-		if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+		_, err := r.db.ExecContext(ctx, stmt)
+		if err == nil {
+			r.renames.Record(exasolclient.RenamePrincipal, upOld, upNew)
+		}
+		unlockDelete()
+		if err != nil {
 			resp.Diagnostics.AddError("RENAME USER failed", err.Error())
 			return
 		}
-		r.renames.Record(exasolclient.RenamePrincipal, upOld, upNew)
 	}
 
 	// Change authentication if type/params changed

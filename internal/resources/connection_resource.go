@@ -37,7 +37,10 @@ func (r *ConnectionResource) Schema(_ context.Context, _ resource.SchemaRequest,
 	resp.Schema = schema.Schema{
 		Description: "Creates, updates and drops an Exasol connection. " +
 			"Connections are used for IMPORT/EXPORT operations and can connect to " +
-			"external databases (Exasol, Oracle, JDBC), file servers (FTP, S3), and other systems.",
+			"external databases (Exasol, Oracle, JDBC), file servers (FTP, S3), and other systems. " +
+			"Renaming keeps its grants: Exasol moves them to the new name. When a grant that references it changes in the same apply, " +
+			"the provider revokes the previous grant under the new name. If the rename and the grant change land in different runs " +
+			"(-target, a failed apply, another provider alias, or a rename outside Terraform), check the renamed object for leftover grants.",
 		Attributes: map[string]schema.Attribute{
 			"name": schema.StringAttribute{
 				Required:    true,
@@ -192,13 +195,20 @@ func (r *ConnectionResource) Update(ctx context.Context, req resource.UpdateRequ
 
 	// If name changed, we need to rename first
 	if upOld != upNew {
+		// Hold the grant lock across RENAME and Record, so a grant Update either
+		// sees the rename in the log or revokes under the old name before it.
+		lockDelete()
 		stmt := fmt.Sprintf(`RENAME CONNECTION "%s" TO "%s"`, upOld, upNew)
 		tflog.Info(ctx, "Renaming connection", map[string]any{"sql": stmt})
-		if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+		_, err := r.db.ExecContext(ctx, stmt)
+		if err == nil {
+			r.renames.Record(exasolclient.RenameConnection, upOld, upNew)
+		}
+		unlockDelete()
+		if err != nil {
 			resp.Diagnostics.AddError("RENAME CONNECTION failed", err.Error())
 			return
 		}
-		r.renames.Record(exasolclient.RenameConnection, upOld, upNew)
 	}
 
 	// Check if connection properties changed

@@ -9,7 +9,9 @@ import (
 type Client struct {
 	DB *sql.DB
 	// Renames records the renames this provider instance executed. Terraform
-	// starts one provider instance per command, so it covers one apply.
+	// starts one provider instance per provider configuration and command, so
+	// it covers one apply of one provider block. A rename through another
+	// provider alias, or in another run, is not in it.
 	Renames *RenameLog
 }
 
