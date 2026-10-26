@@ -1330,6 +1330,19 @@ resource "exasol_schema" "test" {
 				},
 				Check: testAccCheckSchemaComment("ACC_SCHEMA_COMMENT_V2", "Staging"),
 			},
+			// Import does not track the comment until the config sets it
+			{
+				ResourceName:            "exasol_schema.test",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"comment"},
+				ImportStateCheck: func(states []*terraform.InstanceState) error {
+					if v, ok := states[0].Attributes["comment"]; ok && v != "" {
+						return fmt.Errorf("imported comment = %q, want unset", v)
+					}
+					return nil
+				},
+			},
 			// Removing the attribute clears the comment
 			{
 				Config: config("ACC_SCHEMA_COMMENT_V2", ""),
@@ -1349,6 +1362,33 @@ resource "exasol_schema" "test" {
 				},
 				Config:   config("ACC_SCHEMA_COMMENT_V2", ""),
 				PlanOnly: true,
+			},
+		},
+	})
+}
+
+// Quoted schema names are case-sensitive: the comment must land on the
+// lowercase schema, not on an uppercase spelling of it.
+func TestAccSchema_CommentLowercase(t *testing.T) {
+	config := func(comment string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "test" {
+  name    = "acc_schema_comment_lower"
+  comment = %q
+}`, comment)
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckSchemaDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config("lower v1"),
+				Check:  testAccCheckSchemaComment("acc_schema_comment_lower", "lower v1"),
+			},
+			{
+				Config: config("lower v2"),
+				Check:  testAccCheckSchemaComment("acc_schema_comment_lower", "lower v2"),
 			},
 		},
 	})
