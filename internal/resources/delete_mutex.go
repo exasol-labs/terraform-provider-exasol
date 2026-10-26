@@ -6,8 +6,8 @@ import "sync"
 // to prevent transaction collision errors (40001)
 // in Exasol when multiple REVOKE/DROP statements execute simultaneously.
 //
-// A future improvement would be retry logic with exponential backoff for error 40001,
-// which would allow parallel deletes while handling occasional collisions.
+// execWrite also retries a statement after error 40001. That covers creates,
+// which run in parallel; deletes stay serialized as before.
 var deleteMutex sync.Mutex
 
 // lockDelete locks the global delete mutex to serialize delete operations.

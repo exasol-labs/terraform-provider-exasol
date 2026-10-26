@@ -4,9 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math/rand/v2"
 	"strings"
+	"time"
 
 	"terraform-provider-exasol/internal/exasolclient"
+
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
 func qualify(obj string) string {
@@ -197,10 +204,43 @@ func cachedRow(ctx context.Context, db *sql.DB, reads *exasolclient.ReadCache, q
 	return rows[0], nil
 }
 
+// collisionRetries is how often execWrite runs a statement again after a
+// transaction collision. The waits add up to about 3 seconds.
+const collisionRetries = 5
+
 // execWrite runs a statement that changes the database and then clears the
 // read cache, so a later Read does not see rows from before the change.
+//
+// Parallel GRANT, REVOKE and DROP statements can collide in Exasol (SQL error
+// 40001). Exasol rolls the colliding statement back completely, so execWrite
+// runs it again after a short random wait.
 func execWrite(ctx context.Context, db *sql.DB, reads *exasolclient.ReadCache, query string, args ...any) (sql.Result, error) {
-	res, err := db.ExecContext(ctx, query, args...)
-	reads.Clear()
-	return res, err
+	defer reads.Clear()
+	for attempt := 0; ; attempt++ {
+		res, err := db.ExecContext(ctx, query, args...)
+		if err == nil || attempt == collisionRetries || !isTransactionCollision(err) {
+			return res, err
+		}
+		wait := 100*time.Millisecond<<attempt + rand.N(100*time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(wait):
+		}
+	}
+}
+
+// isTransactionCollision reports whether err is Exasol's SQL error 40001. The
+// driver only returns it as text: "... SQL error code '40001' and message ...".
+func isTransactionCollision(err error) bool {
+	return strings.Contains(err.Error(), "SQL error code '40001'")
+}
+
+// keepRenameInState stores the new name in state right after a rename. When a
+// later step of the same Update fails, Terraform keeps this state, and the next
+// run finds the object under its new name instead of planning to create it.
+func keepRenameInState(ctx context.Context, state *tfsdk.State, id, name types.String) diag.Diagnostics {
+	diags := state.SetAttribute(ctx, path.Root("id"), id)
+	diags.Append(state.SetAttribute(ctx, path.Root("name"), name)...)
+	return diags
 }

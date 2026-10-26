@@ -237,6 +237,7 @@ func (r *UserResource) Update(ctx context.Context, req resource.UpdateRequest, r
 			resp.Diagnostics.AddError("RENAME USER failed", err.Error())
 			return
 		}
+		resp.Diagnostics.Append(keepRenameInState(ctx, &resp.State, types.StringValue(upNew), plan.Name)...)
 	}
 
 	// Change authentication if type/params changed

@@ -9,6 +9,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - Refresh reads each system view once per plan, refresh or import (per provider configuration) instead of once per resource. `terraform plan` sent one query per resource to `EXA_DBA_ROLE_PRIVS`, `EXA_DBA_SYS_PRIVS`, `EXA_DBA_OBJ_PRIVS`, `EXA_DBA_IMPERSONATION_PRIVS`, `EXA_DBA_CONNECTION_PRIVS`, `EXA_DBA_USERS`, `EXA_DBA_ROLES`, `EXA_DBA_CONNECTIONS` and `EXA_ALL_SCHEMAS`, and each query costs about the same however few rows it returns. The provider now loads each view on the first read and answers the other resources from memory. Every statement that changes the database clears these copies, so a later read sees the database again. Create, update and delete still query the database directly. Measured on a local database with a copy of a production configuration (3,779 Exasol resources): 8,689 queries and 19 seconds per plan before, 10 queries and 4 seconds after, with the same plan, also after grants were revoked outside Terraform
 
+### Fixed
+- Statements that collide with a parallel transaction (Exasol SQL error 40001) are run again, up to 5 times within about 3 seconds. Exasol rolls a colliding statement back completely. Parallel creates, such as many `exasol_user_impersonation_grant` resources in one apply, failed with "Transaction collision" before
+- `exasol_schema` drops a schema it just created when setting its comment or owner fails. Before, the schema stayed outside Terraform state and the next apply failed with "already exists". The schema is dropped without `CASCADE`, so only an empty schema is removed
+- `exasol_schema`, `exasol_user` and `exasol_connection` keep the new name in state when a rename succeeds and a later step of the same update fails. Before, the next run did not find the object and planned to create it again
+
 ## [0.3.1] - 2026-10-26
 
 ### Added

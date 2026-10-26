@@ -1287,6 +1287,66 @@ resource "exasol_schema" "test" {
 	})
 }
 
+// A failed owner change must not leave the new schema outside state: the
+// next apply would fail with "already exists".
+func TestAccSchema_CreateFailureDropsSchema(t *testing.T) {
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckSchemaDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: providerConfig() + `
+resource "exasol_schema" "test" {
+  name  = "ACC_SCHEMA_CREATE_FAIL"
+  owner = "ACC_NO_SUCH_OWNER"
+}`,
+				ExpectError: regexp.MustCompile(`ALTER SCHEMA CHANGE OWNER failed`),
+			},
+			{
+				Config: providerConfig() + `
+resource "exasol_schema" "test" {
+  name = "ACC_SCHEMA_CREATE_FAIL"
+}`,
+				Check: resource.TestCheckResourceAttr("exasol_schema.test", "name", "ACC_SCHEMA_CREATE_FAIL"),
+			},
+		},
+	})
+}
+
+// A rename followed by a failed owner change must keep the new name in state,
+// so the next run updates the schema instead of trying to create it again.
+func TestAccSchema_RenameThenFailureKeepsName(t *testing.T) {
+	config := func(name, owner string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "test" {
+  name = %q
+%s
+}`, name, owner)
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckSchemaDestroy,
+		Steps: []resource.TestStep{
+			{Config: config("ACC_SCHEMA_RENAME_FAIL_V1", "")},
+			{
+				Config:      config("ACC_SCHEMA_RENAME_FAIL_V2", `  owner = "ACC_NO_SUCH_OWNER"`),
+				ExpectError: regexp.MustCompile(`ALTER SCHEMA CHANGE OWNER failed`),
+			},
+			{
+				Config: config("ACC_SCHEMA_RENAME_FAIL_V2", ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("exasol_schema.test", plancheck.ResourceActionNoop),
+					},
+				},
+				Check: resource.TestCheckResourceAttr("exasol_schema.test", "id", "ACC_SCHEMA_RENAME_FAIL_V2"),
+			},
+		},
+	})
+}
+
 func TestAccSchema_WithOwner(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },

@@ -210,6 +210,7 @@ func (r *ConnectionResource) Update(ctx context.Context, req resource.UpdateRequ
 			resp.Diagnostics.AddError("RENAME CONNECTION failed", err.Error())
 			return
 		}
+		resp.Diagnostics.Append(keepRenameInState(ctx, &resp.State, types.StringValue(upNew), plan.Name)...)
 	}
 
 	// Check if connection properties changed

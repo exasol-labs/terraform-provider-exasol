@@ -102,6 +102,32 @@ func (r *SchemaResource) ValidateConfig(ctx context.Context, req resource.Valida
 	}
 }
 
+// configureNewSchema sets the comment and owner of a schema Create just made.
+// On error it returns the diagnostic summary.
+func (r *SchemaResource) configureNewSchema(ctx context.Context, schemaName string, plan schemaModel) (string, error) {
+	// Comment before the owner transfer: afterwards a non-DBA provider user
+	// no longer owns the schema and may not comment on it
+	if !plan.Comment.IsNull() {
+		if err := r.setSchemaComment(ctx, schemaName, plan.Comment); err != nil {
+			return "COMMENT ON SCHEMA failed", err
+		}
+	}
+
+	// Transfer ownership if specified
+	if !plan.Owner.IsNull() && !plan.Owner.IsUnknown() {
+		owner := plan.Owner.ValueString()
+		if !isValidIdentifier(owner) {
+			return "Invalid owner name", fmt.Errorf("owner name %q contains invalid characters", owner)
+		}
+		alterStmt := fmt.Sprintf(`ALTER SCHEMA "%s" CHANGE OWNER "%s"`, schemaName, owner)
+		tflog.Info(ctx, "Transferring schema ownership", map[string]any{"sql": alterStmt})
+		if _, err := execWrite(ctx, r.db, r.reads, alterStmt); err != nil {
+			return "ALTER SCHEMA CHANGE OWNER failed", err
+		}
+	}
+	return "", nil
+}
+
 // setSchemaComment runs COMMENT ON SCHEMA; a null comment clears it.
 func (r *SchemaResource) setSchemaComment(ctx context.Context, schemaName string, comment types.String) error {
 	value := "NULL"
@@ -141,29 +167,18 @@ func (r *SchemaResource) Create(ctx context.Context, req resource.CreateRequest,
 		return
 	}
 
-	// Comment before the owner transfer: afterwards a non-DBA provider user
-	// no longer owns the schema and may not comment on it
-	if !plan.Comment.IsNull() {
-		if err := r.setSchemaComment(ctx, schemaName, plan.Comment); err != nil {
-			resp.Diagnostics.AddError("COMMENT ON SCHEMA failed", err.Error())
-			return
+	// A failed comment or owner change would leave the schema outside state,
+	// and the next apply would fail with "already exists". The schema is new
+	// and empty, so drop it again (DROP without CASCADE only drops it empty).
+	if summary, err := r.configureNewSchema(ctx, schemaName, plan); err != nil {
+		detail := err.Error()
+		dropStmt := fmt.Sprintf(`DROP SCHEMA "%s"`, escapeIdentifierLiteral(schemaName))
+		tflog.Info(ctx, "Dropping schema after failed create", map[string]any{"sql": dropStmt})
+		if _, dropErr := execWrite(ctx, r.db, r.reads, dropStmt); dropErr != nil {
+			detail += fmt.Sprintf("\n\nThe new schema could not be dropped again: %s\nDrop or import it before the next apply.", dropErr)
 		}
-	}
-
-	// Transfer ownership if specified
-	if !plan.Owner.IsNull() && !plan.Owner.IsUnknown() {
-		owner := plan.Owner.ValueString()
-		if !isValidIdentifier(owner) {
-			resp.Diagnostics.AddError("Invalid owner name",
-				fmt.Sprintf("Owner name %q contains invalid characters.", owner))
-			return
-		}
-		alterStmt := fmt.Sprintf(`ALTER SCHEMA "%s" CHANGE OWNER "%s"`, schemaName, owner)
-		tflog.Info(ctx, "Transferring schema ownership", map[string]any{"sql": alterStmt})
-		if _, err := execWrite(ctx, r.db, r.reads, alterStmt); err != nil {
-			resp.Diagnostics.AddError("ALTER SCHEMA CHANGE OWNER failed", err.Error())
-			return
-		}
+		resp.Diagnostics.AddError(summary, detail)
+		return
 	}
 
 	plan.ID = plan.Name
@@ -275,6 +290,7 @@ func (r *SchemaResource) Update(ctx context.Context, req resource.UpdateRequest,
 			resp.Diagnostics.AddError("RENAME SCHEMA failed", err.Error())
 			return
 		}
+		resp.Diagnostics.Append(keepRenameInState(ctx, &resp.State, types.StringValue(newName), plan.Name)...)
 	}
 
 	currentName := newName // Use new name if renamed, otherwise same as old
