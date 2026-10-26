@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"terraform-provider-exasol/internal/exasolclient"
 	"terraform-provider-exasol/internal/provider"
 
 	"github.com/exasol/exasol-driver-go"
@@ -1193,6 +1194,52 @@ func testAccCheckUserLogin(user, password string, wantLogin bool) resource.TestC
 			return fmt.Errorf("user %s: login succeeded without CREATE SESSION", user)
 		}
 		return nil
+	}
+}
+
+// --- Read cache ---
+
+// The cache serves a view from one load until Clear, and keys on exact,
+// case-sensitive values like the WHERE clauses it replaces.
+func TestAccReadCache(t *testing.T) {
+	db := testAccDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	const q = `SELECT SCHEMA_NAME, SCHEMA_OWNER FROM EXA_ALL_SCHEMAS`
+	for _, stmt := range []string{`DROP SCHEMA IF EXISTS "ACC_READ_CACHE" CASCADE`, `CREATE SCHEMA "ACC_READ_CACHE"`} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() { _, _ = db.Exec(`DROP SCHEMA IF EXISTS "ACC_READ_CACHE" CASCADE`) }()
+
+	c := exasolclient.NewReadCache()
+	count := func(key string) int {
+		t.Helper()
+		rows, err := c.Rows(ctx, db, q, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(rows)
+	}
+	if n := count("ACC_READ_CACHE"); n != 1 {
+		t.Fatalf("rows for ACC_READ_CACHE = %d, want 1", n)
+	}
+	if n := count("acc_read_cache"); n != 0 {
+		t.Fatalf("rows for acc_read_cache = %d, want 0 (keys are case-sensitive)", n)
+	}
+	if _, err := db.Exec(`DROP SCHEMA "ACC_READ_CACHE" CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	if n := count("ACC_READ_CACHE"); n != 1 {
+		t.Fatalf("rows after drop without Clear = %d, want 1 (cached)", n)
+	}
+	c.Clear()
+	if n := count("ACC_READ_CACHE"); n != 0 {
+		t.Fatalf("rows after Clear = %d, want 0", n)
+	}
+	if _, err := c.Rows(ctx, db, `SELECT ROLE_NAME FROM EXA_DBA_ROLES`, "A", "B"); err == nil {
+		t.Fatal("more key columns than the query has: want an error")
 	}
 }
 

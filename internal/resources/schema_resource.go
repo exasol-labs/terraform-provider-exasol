@@ -22,6 +22,7 @@ var _ resource.ResourceWithValidateConfig = &SchemaResource{}
 // SchemaResource manages Exasol schemas.
 type SchemaResource struct {
 	db      *sql.DB
+	reads   *exasolclient.ReadCache
 	renames *exasolclient.RenameLog
 }
 
@@ -69,6 +70,7 @@ func (r *SchemaResource) Configure(_ context.Context, req resource.ConfigureRequ
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.reads = c.Reads
 		r.renames = c.Renames
 	}
 }
@@ -108,7 +110,7 @@ func (r *SchemaResource) setSchemaComment(ctx context.Context, schemaName string
 	}
 	sqlStmt := fmt.Sprintf(`COMMENT ON SCHEMA "%s" IS %s`, escapeIdentifierLiteral(schemaName), value)
 	tflog.Info(ctx, "Setting schema comment", map[string]any{"sql": sqlStmt})
-	_, err := r.db.ExecContext(ctx, sqlStmt)
+	_, err := execWrite(ctx, r.db, r.reads, sqlStmt)
 	return err
 }
 
@@ -134,7 +136,7 @@ func (r *SchemaResource) Create(ctx context.Context, req resource.CreateRequest,
 
 	sqlStmt := fmt.Sprintf(`CREATE SCHEMA "%s"`, schemaName)
 	tflog.Info(ctx, "Creating schema", map[string]any{"sql": sqlStmt})
-	if _, err := r.db.ExecContext(ctx, sqlStmt); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, sqlStmt); err != nil {
 		resp.Diagnostics.AddError("CREATE SCHEMA failed", err.Error())
 		return
 	}
@@ -158,7 +160,7 @@ func (r *SchemaResource) Create(ctx context.Context, req resource.CreateRequest,
 		}
 		alterStmt := fmt.Sprintf(`ALTER SCHEMA "%s" CHANGE OWNER "%s"`, schemaName, owner)
 		tflog.Info(ctx, "Transferring schema ownership", map[string]any{"sql": alterStmt})
-		if _, err := r.db.ExecContext(ctx, alterStmt); err != nil {
+		if _, err := execWrite(ctx, r.db, r.reads, alterStmt); err != nil {
 			resp.Diagnostics.AddError("ALTER SCHEMA CHANGE OWNER failed", err.Error())
 			return
 		}
@@ -194,17 +196,17 @@ func (r *SchemaResource) Read(ctx context.Context, req resource.ReadRequest, res
 		return
 	}
 
-	var owner, comment sql.NullString
-	query := `SELECT SCHEMA_OWNER, SCHEMA_COMMENT FROM EXA_ALL_SCHEMAS WHERE SCHEMA_NAME = ?`
-	err := r.db.QueryRowContext(ctx, query, state.ID.ValueString()).Scan(&owner, &comment)
-	if err == sql.ErrNoRows {
-		resp.State.RemoveResource(ctx)
-		return
-	}
+	row, err := cachedRow(ctx, r.db, r.reads,
+		`SELECT SCHEMA_NAME, SCHEMA_OWNER, SCHEMA_COMMENT FROM EXA_ALL_SCHEMAS`, state.ID.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Read schema failed", err.Error())
 		return
 	}
+	if row == nil {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+	owner, comment := row[1], row[2]
 
 	// Update owner in state
 	if owner.Valid {
@@ -264,7 +266,7 @@ func (r *SchemaResource) Update(ctx context.Context, req resource.UpdateRequest,
 		lockDelete()
 		sqlStmt := fmt.Sprintf(`RENAME SCHEMA "%s" TO "%s"`, oldName, newName)
 		tflog.Info(ctx, "Renaming schema", map[string]any{"sql": sqlStmt})
-		_, err := r.db.ExecContext(ctx, sqlStmt)
+		_, err := execWrite(ctx, r.db, r.reads, sqlStmt)
 		if err == nil {
 			r.renames.Record(exasolclient.RenameSchema, oldName, newName)
 		}
@@ -298,7 +300,7 @@ func (r *SchemaResource) Update(ctx context.Context, req resource.UpdateRequest,
 			}
 			alterStmt := fmt.Sprintf(`ALTER SCHEMA "%s" CHANGE OWNER "%s"`, currentName, newOwner)
 			tflog.Info(ctx, "Changing schema ownership", map[string]any{"sql": alterStmt})
-			if _, err := r.db.ExecContext(ctx, alterStmt); err != nil {
+			if _, err := execWrite(ctx, r.db, r.reads, alterStmt); err != nil {
 				resp.Diagnostics.AddError("ALTER SCHEMA CHANGE OWNER failed", err.Error())
 				return
 			}
@@ -351,7 +353,7 @@ func (r *SchemaResource) Delete(ctx context.Context, req resource.DeleteRequest,
 
 	sqlStmt := fmt.Sprintf(`DROP SCHEMA "%s" CASCADE`, schemaName)
 	tflog.Info(ctx, "Dropping schema", map[string]any{"sql": sqlStmt})
-	if _, err := r.db.ExecContext(ctx, sqlStmt); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, sqlStmt); err != nil {
 		resp.Diagnostics.AddError("DROP SCHEMA failed", err.Error())
 	}
 }

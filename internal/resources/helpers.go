@@ -185,3 +185,22 @@ func objectExists(ctx context.Context, db *sql.DB, name string) (bool, error) {
 	// access to it, like the other EXA_DBA_* views the provider uses.
 	return rowExists(ctx, db, `SELECT 1 FROM EXA_DBA_SCHEMAS WHERE SCHEMA_NAME = ?`, unquoted)
 }
+
+// cachedRow returns the first row of query whose leading columns equal key,
+// from the read cache, or nil when there is none. Only Read uses it: Create
+// and Update query directly, so an apply does not reload whole views.
+func cachedRow(ctx context.Context, db *sql.DB, reads *exasolclient.ReadCache, query string, key ...string) ([]sql.NullString, error) {
+	rows, err := reads.Rows(ctx, db, query, key...)
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	return rows[0], nil
+}
+
+// execWrite runs a statement that changes the database and then clears the
+// read cache, so a later Read does not see rows from before the change.
+func execWrite(ctx context.Context, db *sql.DB, reads *exasolclient.ReadCache, query string, args ...any) (sql.Result, error) {
+	res, err := db.ExecContext(ctx, query, args...)
+	reads.Clear()
+	return res, err
+}
