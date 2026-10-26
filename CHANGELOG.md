@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.1] - 2026-10-26
+
+### Added
+- `exasol_schema` has a new optional `comment` attribute that sets the schema comment with `COMMENT ON SCHEMA`. Removing the attribute clears the comment. Comments set outside Terraform, or present on an imported schema, are not tracked until `comment` is set, so upgrading does not plan any change for existing schemas. The plan rejects an empty string, because Exasol stores it as NULL, and a comment longer than 2000 characters, the Exasol limit
+
 ## [0.3.0] - 2026-10-15
 
 ### Changed

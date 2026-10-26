@@ -1,5 +1,6 @@
 resource "exasol_schema" "analytics" {
-  name = "ANALYTICS"
+  name    = "ANALYTICS"
+  comment = "Curated tables for reporting"
 }
 
 # Schema with ownership transfer

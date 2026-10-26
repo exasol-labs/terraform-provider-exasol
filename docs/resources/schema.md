@@ -14,7 +14,8 @@ Creates, renames and drops an Exasol schema. Renaming keeps its grants: Exasol m
 
 ```terraform
 resource "exasol_schema" "analytics" {
-  name = "ANALYTICS"
+  name    = "ANALYTICS"
+  comment = "Curated tables for reporting"
 }
 
 # Schema with ownership transfer
@@ -33,6 +34,7 @@ resource "exasol_schema" "staging" {
 
 ### Optional
 
+- `comment` (String) Schema comment. Removing the attribute clears the comment. Comments set outside Terraform, or present on an imported schema, are not tracked until this attribute is set; the next apply then sets the configured comment.
 - `owner` (String) Schema owner (user or role). If specified, ownership will be transferred after creation.
 
 ### Read-Only

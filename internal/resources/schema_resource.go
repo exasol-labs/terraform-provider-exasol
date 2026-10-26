@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"unicode/utf8"
 
 	"terraform-provider-exasol/internal/exasolclient"
 
@@ -16,6 +17,7 @@ import (
 
 var _ resource.Resource = &SchemaResource{}
 var _ resource.ResourceWithImportState = &SchemaResource{}
+var _ resource.ResourceWithValidateConfig = &SchemaResource{}
 
 // SchemaResource manages Exasol schemas.
 type SchemaResource struct {
@@ -47,6 +49,12 @@ func (r *SchemaResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Computed:    true,
 				Description: "Schema owner (user or role). If specified, ownership will be transferred after creation.",
 			},
+			"comment": schema.StringAttribute{
+				Optional: true,
+				Description: "Schema comment. Removing the attribute clears the comment. " +
+					"Comments set outside Terraform, or present on an imported schema, are not tracked until this attribute is set; " +
+					"the next apply then sets the configured comment.",
+			},
 			"id": schema.StringAttribute{
 				Computed:    true,
 				Description: "Current schema name (used as Terraform ID).",
@@ -66,9 +74,42 @@ func (r *SchemaResource) Configure(_ context.Context, req resource.ConfigureRequ
 }
 
 type schemaModel struct {
-	ID    types.String `tfsdk:"id"`
-	Name  types.String `tfsdk:"name"`
-	Owner types.String `tfsdk:"owner"`
+	ID      types.String `tfsdk:"id"`
+	Name    types.String `tfsdk:"name"`
+	Owner   types.String `tfsdk:"owner"`
+	Comment types.String `tfsdk:"comment"`
+}
+
+// maxCommentLength is the Exasol limit for COMMENT ON, in characters.
+const maxCommentLength = 2000
+
+func (r *SchemaResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var comment types.String
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("comment"), &comment)...)
+	if comment.IsNull() || comment.IsUnknown() {
+		return
+	}
+	// Exasol stores an empty string as NULL, so "" would never match state
+	if comment.ValueString() == "" {
+		resp.Diagnostics.AddAttributeError(path.Root("comment"), "Empty schema comment",
+			"Exasol stores an empty comment as NULL. Remove the attribute to clear the comment.")
+	}
+	if n := utf8.RuneCountInString(comment.ValueString()); n > maxCommentLength {
+		resp.Diagnostics.AddAttributeError(path.Root("comment"), "Schema comment too long",
+			fmt.Sprintf("Exasol allows at most %d characters in a comment, got %d.", maxCommentLength, n))
+	}
+}
+
+// setSchemaComment runs COMMENT ON SCHEMA; a null comment clears it.
+func (r *SchemaResource) setSchemaComment(ctx context.Context, schemaName string, comment types.String) error {
+	value := "NULL"
+	if !comment.IsNull() {
+		value = "'" + escapeStringLiteral(comment.ValueString()) + "'"
+	}
+	sqlStmt := fmt.Sprintf(`COMMENT ON SCHEMA "%s" IS %s`, escapeIdentifierLiteral(schemaName), value)
+	tflog.Info(ctx, "Setting schema comment", map[string]any{"sql": sqlStmt})
+	_, err := r.db.ExecContext(ctx, sqlStmt)
+	return err
 }
 
 func (r *SchemaResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -96,6 +137,15 @@ func (r *SchemaResource) Create(ctx context.Context, req resource.CreateRequest,
 	if _, err := r.db.ExecContext(ctx, sqlStmt); err != nil {
 		resp.Diagnostics.AddError("CREATE SCHEMA failed", err.Error())
 		return
+	}
+
+	// Comment before the owner transfer: afterwards a non-DBA provider user
+	// no longer owns the schema and may not comment on it
+	if !plan.Comment.IsNull() {
+		if err := r.setSchemaComment(ctx, schemaName, plan.Comment); err != nil {
+			resp.Diagnostics.AddError("COMMENT ON SCHEMA failed", err.Error())
+			return
+		}
 	}
 
 	// Transfer ownership if specified
@@ -144,9 +194,9 @@ func (r *SchemaResource) Read(ctx context.Context, req resource.ReadRequest, res
 		return
 	}
 
-	var owner sql.NullString
-	query := `SELECT SCHEMA_OWNER FROM EXA_ALL_SCHEMAS WHERE SCHEMA_NAME = ?`
-	err := r.db.QueryRowContext(ctx, query, state.ID.ValueString()).Scan(&owner)
+	var owner, comment sql.NullString
+	query := `SELECT SCHEMA_OWNER, SCHEMA_COMMENT FROM EXA_ALL_SCHEMAS WHERE SCHEMA_NAME = ?`
+	err := r.db.QueryRowContext(ctx, query, state.ID.ValueString()).Scan(&owner, &comment)
 	if err == sql.ErrNoRows {
 		resp.State.RemoveResource(ctx)
 		return
@@ -161,6 +211,16 @@ func (r *SchemaResource) Read(ctx context.Context, req resource.ReadRequest, res
 		state.Owner = types.StringValue(owner.String)
 	} else {
 		state.Owner = types.StringNull()
+	}
+
+	// Only track the comment once Terraform manages it, so upgrading does not
+	// plan to clear comments set outside Terraform
+	if !state.Comment.IsNull() {
+		if comment.Valid {
+			state.Comment = types.StringValue(comment.String)
+		} else {
+			state.Comment = types.StringNull()
+		}
 	}
 
 	// After import, name is empty - populate it from the ID
@@ -215,8 +275,17 @@ func (r *SchemaResource) Update(ctx context.Context, req resource.UpdateRequest,
 		}
 	}
 
-	// Handle ownership change
 	currentName := newName // Use new name if renamed, otherwise same as old
+
+	// Comment before the owner change, see Create
+	if !plan.Comment.Equal(state.Comment) {
+		if err := r.setSchemaComment(ctx, currentName, plan.Comment); err != nil {
+			resp.Diagnostics.AddError("COMMENT ON SCHEMA failed", err.Error())
+			return
+		}
+	}
+
+	// Handle ownership change
 	if !plan.Owner.IsNull() && !plan.Owner.IsUnknown() {
 		newOwner := plan.Owner.ValueString()
 		oldOwner := state.Owner.ValueString()
