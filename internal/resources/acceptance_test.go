@@ -1263,6 +1263,97 @@ resource "exasol_schema" "test" {
 	})
 }
 
+func testAccCheckSchemaComment(schemaName, want string) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		db := mustOpenDB()
+		defer db.Close()
+		var got sql.NullString
+		if err := db.QueryRow(`SELECT SCHEMA_COMMENT FROM EXA_ALL_SCHEMAS WHERE SCHEMA_NAME = ?`, schemaName).Scan(&got); err != nil {
+			return err
+		}
+		if got.String != want {
+			return fmt.Errorf("schema %s comment = %q, want %q", schemaName, got.String, want)
+		}
+		return nil
+	}
+}
+
+func TestAccSchema_Comment(t *testing.T) {
+	config := func(name, comment string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "test" {
+  name = %q
+%s
+}`, name, comment)
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckSchemaDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config:      config("ACC_SCHEMA_COMMENT", `  comment = ""`),
+				ExpectError: regexp.MustCompile(`Empty schema comment`),
+			},
+			{
+				Config: config("ACC_SCHEMA_COMMENT", `  comment = "Raw data, don't query"`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("exasol_schema.test", "comment", "Raw data, don't query"),
+					testAccCheckSchemaComment("ACC_SCHEMA_COMMENT", "Raw data, don't query"),
+				),
+			},
+			{
+				Config:      config("ACC_SCHEMA_COMMENT", fmt.Sprintf("  comment = %q", strings.Repeat("x", 2001))),
+				ExpectError: regexp.MustCompile(`Schema comment too long`),
+			},
+			// A managed comment changed outside Terraform shows as drift
+			{
+				PreConfig: func() {
+					db := mustOpenDB()
+					defer db.Close()
+					// 2000 characters is the documented Exasol limit
+					if _, err := db.Exec(`COMMENT ON SCHEMA "ACC_SCHEMA_COMMENT" IS '` + strings.Repeat("x", 2000) + `'`); err != nil {
+						t.Fatal(err)
+					}
+				},
+				Config:             config("ACC_SCHEMA_COMMENT", `  comment = "Raw data, don't query"`),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			// Rename and change comment in one update
+			{
+				Config: config("ACC_SCHEMA_COMMENT_V2", `  comment = "Staging"`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("exasol_schema.test", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: testAccCheckSchemaComment("ACC_SCHEMA_COMMENT_V2", "Staging"),
+			},
+			// Removing the attribute clears the comment
+			{
+				Config: config("ACC_SCHEMA_COMMENT_V2", ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("exasol_schema.test", "comment"),
+					testAccCheckSchemaComment("ACC_SCHEMA_COMMENT_V2", ""),
+				),
+			},
+			// A comment set outside Terraform is left alone while unmanaged
+			{
+				PreConfig: func() {
+					db := mustOpenDB()
+					defer db.Close()
+					if _, err := db.Exec(`COMMENT ON SCHEMA "ACC_SCHEMA_COMMENT_V2" IS 'set by hand'`); err != nil {
+						t.Fatal(err)
+					}
+				},
+				Config:   config("ACC_SCHEMA_COMMENT_V2", ""),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
 // --- Connection: create, rename, import ---
 
 func TestAccConnection_FullLifecycle(t *testing.T) {
