@@ -13,6 +13,8 @@ type Client struct {
 	// it covers one apply of one provider block. A rename through another
 	// provider alias, or in another run, is not in it.
 	Renames *RenameLog
+	// Reads caches system views for Read, see ReadCache.
+	Reads *ReadCache
 }
 
 // Rename kinds. Users and roles share one namespace in Exasol.

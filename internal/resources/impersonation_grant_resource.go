@@ -29,6 +29,7 @@ const (
 // one database user or one database role.
 type ImpersonationGrantResource struct {
 	db         *sql.DB
+	reads      *exasolclient.ReadCache
 	targetKind impersonationTargetKind
 	renames    *exasolclient.RenameLog
 }
@@ -69,6 +70,7 @@ func (r *ImpersonationGrantResource) Schema(_ context.Context, _ resource.Schema
 func (r *ImpersonationGrantResource) Configure(_ context.Context, req resource.ConfigureRequest, _ *resource.ConfigureResponse) {
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.reads = c.Reads
 		r.renames = c.Renames
 	}
 }
@@ -85,6 +87,7 @@ func (r *ImpersonationGrantResource) Create(ctx context.Context, req resource.Cr
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	defer lockGrantees(plan.Grantee.ValueString())()
 	if r.db == nil {
 		resp.Diagnostics.AddError("Database not configured", "Provider did not supply a database connection.")
 		return
@@ -104,7 +107,7 @@ func (r *ImpersonationGrantResource) Create(ctx context.Context, req resource.Cr
 	if !exists {
 		grant, _ := impersonationGrantSQL(grantee, target)
 		tflog.Info(ctx, "Granting impersonation", map[string]any{"sql": grant})
-		if _, err := r.db.ExecContext(ctx, grant); err != nil {
+		if _, err := execWrite(ctx, r.db, r.reads, grant); err != nil {
 			resp.Diagnostics.AddError("GRANT IMPERSONATION failed", err.Error())
 			return
 		}
@@ -126,12 +129,13 @@ func (r *ImpersonationGrantResource) Read(ctx context.Context, req resource.Read
 	}
 
 	grantee, target := r.names(state.Grantee.ValueString(), state.Target.ValueString())
-	exists, err := r.grantExists(ctx, grantee, target)
+	row, err := cachedRow(ctx, r.db, r.reads,
+		`SELECT GRANTEE, IMPERSONATION_ON FROM EXA_DBA_IMPERSONATION_PRIVS`, grantee, target)
 	if err != nil {
 		resp.Diagnostics.AddError("Read impersonation grant failed", err.Error())
 		return
 	}
-	if !exists {
+	if row == nil {
 		resp.State.RemoveResource(ctx)
 		return
 	}
@@ -152,6 +156,7 @@ func (r *ImpersonationGrantResource) Update(ctx context.Context, req resource.Up
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	defer lockGranteesAndRenames(r.renames, plan.Grantee.ValueString(), state.Grantee.ValueString())()
 	if r.db == nil {
 		resp.Diagnostics.AddError("Database not configured", "Provider did not supply a database connection.")
 		return
@@ -203,7 +208,7 @@ func (r *ImpersonationGrantResource) Update(ctx context.Context, req resource.Up
 	if oldExists {
 		_, revoke := impersonationGrantSQL(oldGrantee, oldTarget)
 		tflog.Info(ctx, "Revoking old impersonation", map[string]any{"sql": revoke})
-		if _, err := r.db.ExecContext(ctx, revoke); err != nil {
+		if _, err := execWrite(ctx, r.db, r.reads, revoke); err != nil {
 			resp.Diagnostics.AddError("REVOKE IMPERSONATION failed", err.Error())
 			return
 		}
@@ -211,14 +216,14 @@ func (r *ImpersonationGrantResource) Update(ctx context.Context, req resource.Up
 	if !newExists {
 		grant, _ := impersonationGrantSQL(newGrantee, newTarget)
 		tflog.Info(ctx, "Granting new impersonation", map[string]any{"sql": grant})
-		if _, err := r.db.ExecContext(ctx, grant); err != nil {
+		if _, err := execWrite(ctx, r.db, r.reads, grant); err != nil {
 			if !oldExists {
 				resp.Diagnostics.AddError("GRANT IMPERSONATION failed", err.Error())
 				return
 			}
 			oldGrant, _ := impersonationGrantSQL(oldGrantee, oldTarget)
 			tflog.Warn(ctx, "Restoring old impersonation after failed update", map[string]any{"sql": oldGrant})
-			if _, rollbackErr := r.db.ExecContext(ctx, oldGrant); rollbackErr != nil {
+			if _, rollbackErr := execWrite(ctx, r.db, r.reads, oldGrant); rollbackErr != nil {
 				resp.Diagnostics.AddError("GRANT IMPERSONATION failed and rollback failed", fmt.Sprintf("grant error: %v; rollback error: %v", err, rollbackErr))
 				return
 			}
@@ -250,6 +255,8 @@ func (r *ImpersonationGrantResource) Delete(ctx context.Context, req resource.De
 	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, grantee); ok {
 		grantee = current
 	}
+	// Lock the name the grant lives under now, too: a Create on it must wait.
+	defer lockGrantees(state.Grantee.ValueString(), grantee)()
 	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, target); ok {
 		target = current
 	}
@@ -263,7 +270,7 @@ func (r *ImpersonationGrantResource) Delete(ctx context.Context, req resource.De
 	}
 	_, revoke := impersonationGrantSQL(grantee, target)
 	tflog.Info(ctx, "Revoking impersonation", map[string]any{"sql": revoke})
-	if _, err := r.db.ExecContext(ctx, revoke); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, revoke); err != nil {
 		resp.Diagnostics.AddError("REVOKE IMPERSONATION failed", err.Error())
 	}
 }

@@ -22,6 +22,7 @@ var _ resource.ResourceWithImportState = &SystemPrivilegeResource{}
 // System privileges include: CREATE SESSION, CREATE TABLE, CREATE SCHEMA, etc.
 type SystemPrivilegeResource struct {
 	db      *sql.DB
+	reads   *exasolclient.ReadCache
 	renames *exasolclient.RenameLog
 }
 
@@ -64,6 +65,7 @@ func (r *SystemPrivilegeResource) Configure(_ context.Context, req resource.Conf
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.reads = c.Reads
 		r.renames = c.Renames
 	}
 }
@@ -81,6 +83,7 @@ func (r *SystemPrivilegeResource) Create(ctx context.Context, req resource.Creat
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	defer lockGrantees(plan.Grantee.ValueString())()
 	if r.db == nil {
 		resp.Diagnostics.AddError("Database not configured", "Provider did not supply a database connection.")
 		return
@@ -102,7 +105,7 @@ func (r *SystemPrivilegeResource) Create(ctx context.Context, req resource.Creat
 	}
 
 	tflog.Info(ctx, "Granting system privilege", map[string]any{"sql": stmt})
-	if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, stmt); err != nil {
 		resp.Diagnostics.AddError("GRANT failed", err.Error())
 		return
 	}
@@ -127,17 +130,17 @@ func (r *SystemPrivilegeResource) Read(ctx context.Context, req resource.ReadReq
 	privilege := strings.ToUpper(state.Privilege.ValueString())
 
 	// Check if privilege exists in EXA_DBA_SYS_PRIVS
-	query := `SELECT ADMIN_OPTION FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE = ? AND PRIVILEGE = ?`
-	var adminOption string
-	err := r.db.QueryRowContext(ctx, query, grantee, privilege).Scan(&adminOption)
-	if err == sql.ErrNoRows {
-		resp.State.RemoveResource(ctx)
-		return
-	}
+	row, err := cachedRow(ctx, r.db, r.reads,
+		`SELECT GRANTEE, PRIVILEGE, ADMIN_OPTION FROM EXA_DBA_SYS_PRIVS`, grantee, privilege)
 	if err != nil {
 		resp.Diagnostics.AddError("Read system privilege failed", err.Error())
 		return
 	}
+	if row == nil {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+	adminOption := row[2].String
 
 	// Set with_admin_option based on database value
 	// If database has TRUE, set to true. If database has FALSE, set to null.
@@ -165,6 +168,7 @@ func (r *SystemPrivilegeResource) Update(ctx context.Context, req resource.Updat
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	defer lockGranteesAndRenames(r.renames, plan.Grantee.ValueString(), state.Grantee.ValueString())()
 	if r.db == nil {
 		resp.Diagnostics.AddError("Database not configured", "Provider did not supply a database connection.")
 		return
@@ -203,7 +207,7 @@ func (r *SystemPrivilegeResource) Update(ctx context.Context, req resource.Updat
 			if oldExists {
 				revokeStmt := fmt.Sprintf(`REVOKE %s FROM "%s"`, oldPrivilege, curGrantee)
 				tflog.Info(ctx, "Revoking old system privilege", map[string]any{"sql": revokeStmt})
-				if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+				if _, err := execWrite(ctx, r.db, r.reads, revokeStmt); err != nil {
 					resp.Diagnostics.AddError("REVOKE failed", err.Error())
 					return
 				}
@@ -219,7 +223,7 @@ func (r *SystemPrivilegeResource) Update(ctx context.Context, req resource.Updat
 		if newExists && newAdmin != wantAdmin {
 			revokeStmt := fmt.Sprintf(`REVOKE %s FROM "%s"`, newPrivilege, newGrantee)
 			tflog.Info(ctx, "Revoking system privilege to update admin option", map[string]any{"sql": revokeStmt})
-			if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+			if _, err := execWrite(ctx, r.db, r.reads, revokeStmt); err != nil {
 				resp.Diagnostics.AddError("REVOKE failed", err.Error())
 				return
 			}
@@ -231,7 +235,7 @@ func (r *SystemPrivilegeResource) Update(ctx context.Context, req resource.Updat
 				grantStmt += " WITH ADMIN OPTION"
 			}
 			tflog.Info(ctx, "Granting new system privilege", map[string]any{"sql": grantStmt})
-			if _, err := r.db.ExecContext(ctx, grantStmt); err != nil {
+			if _, err := execWrite(ctx, r.db, r.reads, grantStmt); err != nil {
 				resp.Diagnostics.AddError("GRANT failed", err.Error())
 				return
 			}
@@ -243,7 +247,7 @@ func (r *SystemPrivilegeResource) Update(ctx context.Context, req resource.Updat
 
 		revokeStmt := fmt.Sprintf(`REVOKE %s FROM "%s"`, privilege, grantee)
 		tflog.Info(ctx, "Revoking system privilege to update admin option", map[string]any{"sql": revokeStmt})
-		if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+		if _, err := execWrite(ctx, r.db, r.reads, revokeStmt); err != nil {
 			resp.Diagnostics.AddError("REVOKE failed", err.Error())
 			return
 		}
@@ -253,7 +257,7 @@ func (r *SystemPrivilegeResource) Update(ctx context.Context, req resource.Updat
 			grantStmt += " WITH ADMIN OPTION"
 		}
 		tflog.Info(ctx, "Re-granting system privilege with updated admin option", map[string]any{"sql": grantStmt})
-		if _, err := r.db.ExecContext(ctx, grantStmt); err != nil {
+		if _, err := execWrite(ctx, r.db, r.reads, grantStmt); err != nil {
 			resp.Diagnostics.AddError("GRANT failed", err.Error())
 			return
 		}
@@ -284,6 +288,8 @@ func (r *SystemPrivilegeResource) Delete(ctx context.Context, req resource.Delet
 	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, grantee); ok {
 		grantee = current
 	}
+	// Lock the name the grant lives under now, too: a Create on it must wait.
+	defer lockGrantees(state.Grantee.ValueString(), grantee)()
 	// Already gone, e.g. the grantee was dropped: nothing to revoke.
 	exists, _, err := r.privilegeExists(ctx, grantee, privilege)
 	if err != nil {
@@ -296,7 +302,7 @@ func (r *SystemPrivilegeResource) Delete(ctx context.Context, req resource.Delet
 	stmt := fmt.Sprintf(`REVOKE %s FROM "%s"`, privilege, grantee)
 
 	tflog.Info(ctx, "Revoking system privilege", map[string]any{"sql": stmt})
-	if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, stmt); err != nil {
 		resp.Diagnostics.AddError("REVOKE failed", err.Error())
 	}
 }

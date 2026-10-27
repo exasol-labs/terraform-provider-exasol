@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"terraform-provider-exasol/internal/exasolclient"
 	"terraform-provider-exasol/internal/provider"
 
 	"github.com/exasol/exasol-driver-go"
@@ -1196,6 +1197,52 @@ func testAccCheckUserLogin(user, password string, wantLogin bool) resource.TestC
 	}
 }
 
+// --- Read cache ---
+
+// The cache serves a view from one load until Clear, and keys on exact,
+// case-sensitive values like the WHERE clauses it replaces.
+func TestAccReadCache(t *testing.T) {
+	db := testAccDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	const q = `SELECT SCHEMA_NAME, SCHEMA_OWNER FROM EXA_ALL_SCHEMAS`
+	for _, stmt := range []string{`DROP SCHEMA IF EXISTS "ACC_READ_CACHE" CASCADE`, `CREATE SCHEMA "ACC_READ_CACHE"`} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() { _, _ = db.Exec(`DROP SCHEMA IF EXISTS "ACC_READ_CACHE" CASCADE`) }()
+
+	c := exasolclient.NewReadCache()
+	count := func(key string) int {
+		t.Helper()
+		rows, err := c.Rows(ctx, db, q, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(rows)
+	}
+	if n := count("ACC_READ_CACHE"); n != 1 {
+		t.Fatalf("rows for ACC_READ_CACHE = %d, want 1", n)
+	}
+	if n := count("acc_read_cache"); n != 0 {
+		t.Fatalf("rows for acc_read_cache = %d, want 0 (keys are case-sensitive)", n)
+	}
+	if _, err := db.Exec(`DROP SCHEMA "ACC_READ_CACHE" CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	if n := count("ACC_READ_CACHE"); n != 1 {
+		t.Fatalf("rows after drop without Clear = %d, want 1 (cached)", n)
+	}
+	c.Clear()
+	if n := count("ACC_READ_CACHE"); n != 0 {
+		t.Fatalf("rows after Clear = %d, want 0", n)
+	}
+	if _, err := c.Rows(ctx, db, `SELECT ROLE_NAME FROM EXA_DBA_ROLES`, "A", "B"); err == nil {
+		t.Fatal("more key columns than the query has: want an error")
+	}
+}
+
 // --- Schema: create, rename, ownership, import ---
 
 func TestAccSchema_FullLifecycle(t *testing.T) {
@@ -1235,6 +1282,150 @@ resource "exasol_schema" "test" {
 				ResourceName:      "exasol_schema.test",
 				ImportState:       true,
 				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// A failed owner change must not leave the new schema outside state: the
+// next apply would fail with "already exists".
+func TestAccSchema_CreateFailureDropsSchema(t *testing.T) {
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckSchemaDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: providerConfig() + `
+resource "exasol_schema" "test" {
+  name  = "ACC_SCHEMA_CREATE_FAIL"
+  owner = "ACC_NO_SUCH_OWNER"
+}`,
+				ExpectError: regexp.MustCompile(`ALTER SCHEMA CHANGE OWNER failed`),
+			},
+			{
+				Config: providerConfig() + `
+resource "exasol_schema" "test" {
+  name = "ACC_SCHEMA_CREATE_FAIL"
+}`,
+				Check: resource.TestCheckResourceAttr("exasol_schema.test", "name", "ACC_SCHEMA_CREATE_FAIL"),
+			},
+		},
+	})
+}
+
+// A rename followed by a failed owner change must keep the new name in state,
+// so the next run updates the schema instead of trying to create it again.
+func TestAccSchema_RenameThenFailureKeepsName(t *testing.T) {
+	config := func(name, owner string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_schema" "test" {
+  name = %q
+%s
+}`, name, owner)
+	}
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckSchemaDestroy,
+		Steps: []resource.TestStep{
+			{Config: config("ACC_SCHEMA_RENAME_FAIL_V1", "")},
+			{
+				Config:      config("ACC_SCHEMA_RENAME_FAIL_V2", `  owner = "ACC_NO_SUCH_OWNER"`),
+				ExpectError: regexp.MustCompile(`ALTER SCHEMA CHANGE OWNER failed`),
+			},
+			{
+				Config: config("ACC_SCHEMA_RENAME_FAIL_V2", ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("exasol_schema.test", plancheck.ResourceActionNoop),
+					},
+				},
+				Check: resource.TestCheckResourceAttr("exasol_schema.test", "id", "ACC_SCHEMA_RENAME_FAIL_V2"),
+			},
+		},
+	})
+}
+
+// A user rename followed by a failed ALTER USER must keep the new name in
+// state. Exasol rejects an OpenID subject that another user already has.
+func TestAccUser_RenameThenFailureKeepsName(t *testing.T) {
+	config := func(name, auth string) string {
+		return providerConfig() + fmt.Sprintf(`
+resource "exasol_user" "other" {
+  name           = "ACC_USER_OID_OWNER"
+  auth_type      = "OPENID"
+  openid_subject = "acc-dup-subject"
+}
+resource "exasol_user" "test" {
+  name = %q
+%s
+  depends_on = [exasol_user.other]
+}`, name, auth)
+	}
+	password := `  auth_type = "PASSWORD"
+  password  = "Acc_pw_123"`
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckUserDestroy,
+		Steps: []resource.TestStep{
+			{Config: config("ACC_USER_RENAME_FAIL_V1", password)},
+			{
+				Config: config("ACC_USER_RENAME_FAIL_V2", `  auth_type      = "OPENID"
+  openid_subject = "acc-dup-subject"`),
+				ExpectError: regexp.MustCompile(`ALTER USER failed`),
+			},
+			{
+				Config: config("ACC_USER_RENAME_FAIL_V2", password),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("exasol_user.test", plancheck.ResourceActionNoop),
+					},
+				},
+				Check: resource.TestCheckResourceAttr("exasol_user.test", "id", "ACC_USER_RENAME_FAIL_V2"),
+			},
+		},
+	})
+}
+
+// Many grants to one grantee run in parallel in Terraform. Exasol rolls back
+// parallel statements on the same grantee (40001); the provider must
+// serialize them so the apply does not fail.
+func TestAccImpersonationGrant_ManyOnOneGrantee(t *testing.T) {
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckImpersonationGrantDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: providerConfig() + `
+resource "exasol_role" "hub" {
+  name = "ACC_IMP_HUB"
+}
+resource "exasol_user" "u" {
+  count     = 60
+  name      = "ACC_IMP_HUB_USER_${count.index}"
+  auth_type = "PASSWORD"
+  password  = "Acc_pw_123"
+}
+resource "exasol_user_impersonation_grant" "g" {
+  count   = 60
+  grantee = exasol_role.hub.name
+  target  = exasol_user.u[count.index].name
+}`,
+				Check: func(*terraform.State) error {
+					db := mustOpenDB()
+					defer db.Close()
+					var n int
+					if err := db.QueryRow(`SELECT COUNT(*) FROM EXA_DBA_IMPERSONATION_PRIVS WHERE GRANTEE = 'ACC_IMP_HUB'`).Scan(&n); err != nil {
+						return err
+					}
+					if n != 60 {
+						return fmt.Errorf("impersonation grants on ACC_IMP_HUB = %d, want 60", n)
+					}
+					return nil
+				},
 			},
 		},
 	})

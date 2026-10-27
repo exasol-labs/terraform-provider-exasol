@@ -18,6 +18,7 @@ import (
 // RoleResource manages Exasol roles.
 type RoleResource struct {
 	db      *sql.DB
+	reads   *exasolclient.ReadCache
 	renames *exasolclient.RenameLog
 }
 
@@ -57,6 +58,7 @@ func (r *RoleResource) Configure(_ context.Context, req resource.ConfigureReques
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.reads = c.Reads
 		r.renames = c.Renames
 	}
 }
@@ -90,7 +92,7 @@ func (r *RoleResource) Create(ctx context.Context, req resource.CreateRequest, r
 
 	stmt := fmt.Sprintf(`CREATE ROLE "%s"`, upName)
 	tflog.Debug(ctx, "Creating role", map[string]any{"sql": stmt})
-	if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, stmt); err != nil {
 		resp.Diagnostics.AddError("Error creating role", err.Error())
 		return
 	}
@@ -113,17 +115,16 @@ func (r *RoleResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 		return
 	}
 
-	var current string
-	q := `SELECT ROLE_NAME FROM EXA_DBA_ROLES WHERE ROLE_NAME = ?`
-	err := r.db.QueryRowContext(ctx, q, state.ID.ValueString()).Scan(&current)
-	if err == sql.ErrNoRows {
-		resp.State.RemoveResource(ctx)
-		return
-	}
+	row, err := cachedRow(ctx, r.db, r.reads, `SELECT ROLE_NAME FROM EXA_DBA_ROLES`, state.ID.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Error reading role", err.Error())
 		return
 	}
+	if row == nil {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+	current := row[0].String
 
 	// keep the user's spelling of name; only update id (upper-case in DB)
 	state.ID = types.StringValue(upper(current))
@@ -167,7 +168,7 @@ func (r *RoleResource) Update(ctx context.Context, req resource.UpdateRequest, r
 		lockDelete()
 		stmt := fmt.Sprintf(`RENAME ROLE "%s" TO "%s"`, upOld, upNew)
 		tflog.Debug(ctx, "Renaming role", map[string]any{"sql": stmt})
-		_, err := r.db.ExecContext(ctx, stmt)
+		_, err := execWrite(ctx, r.db, r.reads, stmt)
 		if err == nil {
 			r.renames.Record(exasolclient.RenamePrincipal, upOld, upNew)
 		}
@@ -209,7 +210,7 @@ func (r *RoleResource) Delete(ctx context.Context, req resource.DeleteRequest, r
 
 	stmt := fmt.Sprintf(`DROP ROLE "%s"`, upName)
 	tflog.Debug(ctx, "Dropping role", map[string]any{"sql": stmt})
-	if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, stmt); err != nil {
 		resp.Diagnostics.AddError("Error dropping role", err.Error())
 	}
 }

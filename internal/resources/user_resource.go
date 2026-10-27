@@ -23,6 +23,7 @@ var _ resource.ResourceWithModifyPlan = &UserResource{}
 // It supports password, LDAP and OpenID authentication types.
 type UserResource struct {
 	db      *sql.DB
+	reads   *exasolclient.ReadCache
 	renames *exasolclient.RenameLog
 }
 
@@ -92,6 +93,7 @@ func (r *UserResource) Configure(_ context.Context, req resource.ConfigureReques
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.reads = c.Reads
 		r.renames = c.Renames
 	}
 }
@@ -130,7 +132,7 @@ func (r *UserResource) Create(ctx context.Context, req resource.CreateRequest, r
 		return
 	}
 	tflog.Info(ctx, "Creating user", map[string]any{"sql": sanitizeLogSQL(sqlStmt)})
-	if _, err := r.db.ExecContext(ctx, sqlStmt); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, sqlStmt); err != nil {
 		resp.Diagnostics.AddError("CREATE USER failed", err.Error())
 		return
 	}
@@ -153,19 +155,17 @@ func (r *UserResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 
 	// Read back user details from EXA_DBA_USERS.
 	// DISTINGUISHED_NAME and OPENID_SUBJECT are readable; password is a hash (not usable).
-	var distinguishedName sql.NullString
-	var openidSubject sql.NullString
-	err := r.db.QueryRowContext(ctx,
-		`SELECT DISTINGUISHED_NAME, OPENID_SUBJECT FROM EXA_DBA_USERS WHERE USER_NAME = ?`,
-		state.ID.ValueString()).Scan(&distinguishedName, &openidSubject)
-	if err == sql.ErrNoRows {
-		resp.State.RemoveResource(ctx)
-		return
-	}
+	row, err := cachedRow(ctx, r.db, r.reads,
+		`SELECT USER_NAME, DISTINGUISHED_NAME, OPENID_SUBJECT FROM EXA_DBA_USERS`, state.ID.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Read user failed", err.Error())
 		return
 	}
+	if row == nil {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+	distinguishedName, openidSubject := row[1], row[2]
 
 	// After import, name is empty - populate it from the ID
 	if state.Name.IsNull() || state.Name.ValueString() == "" {
@@ -228,7 +228,7 @@ func (r *UserResource) Update(ctx context.Context, req resource.UpdateRequest, r
 		lockDelete()
 		stmt := fmt.Sprintf(`RENAME USER "%s" TO "%s"`, escapedOld, escapedNew)
 		tflog.Info(ctx, "Renaming user", map[string]any{"sql": stmt})
-		_, err := r.db.ExecContext(ctx, stmt)
+		_, err := execWrite(ctx, r.db, r.reads, stmt)
 		if err == nil {
 			r.renames.Record(exasolclient.RenamePrincipal, upOld, upNew)
 		}
@@ -237,6 +237,7 @@ func (r *UserResource) Update(ctx context.Context, req resource.UpdateRequest, r
 			resp.Diagnostics.AddError("RENAME USER failed", err.Error())
 			return
 		}
+		resp.Diagnostics.Append(keepRenameInState(ctx, &resp.State, types.StringValue(upNew), plan.Name)...)
 	}
 
 	// Change authentication if type/params changed
@@ -250,7 +251,7 @@ func (r *UserResource) Update(ctx context.Context, req resource.UpdateRequest, r
 			return
 		}
 		tflog.Info(ctx, "Altering user", map[string]any{"sql": sanitizeLogSQL(alter)})
-		if _, err := r.db.ExecContext(ctx, alter); err != nil {
+		if _, err := execWrite(ctx, r.db, r.reads, alter); err != nil {
 			resp.Diagnostics.AddError("ALTER USER failed", err.Error())
 			return
 		}
@@ -288,7 +289,7 @@ func (r *UserResource) Delete(ctx context.Context, req resource.DeleteRequest, r
 	escapedName := escapeIdentifierLiteral(upName)
 	stmt := fmt.Sprintf(`DROP USER "%s"`, escapedName)
 	tflog.Info(ctx, "Dropping user", map[string]any{"sql": stmt})
-	if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, stmt); err != nil {
 		resp.Diagnostics.AddError("DROP USER failed", err.Error())
 	}
 }

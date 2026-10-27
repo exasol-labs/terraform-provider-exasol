@@ -22,6 +22,7 @@ var _ resource.ResourceWithImportState = &ConnectionResource{}
 // Connections are used for IMPORT/EXPORT and can connect to various external systems.
 type ConnectionResource struct {
 	db      *sql.DB
+	reads   *exasolclient.ReadCache
 	renames *exasolclient.RenameLog
 }
 
@@ -74,6 +75,7 @@ func (r *ConnectionResource) Configure(_ context.Context, req resource.Configure
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.reads = c.Reads
 		r.renames = c.Renames
 	}
 }
@@ -113,7 +115,7 @@ func (r *ConnectionResource) Create(ctx context.Context, req resource.CreateRequ
 	}
 
 	tflog.Info(ctx, "Creating connection", map[string]any{"sql": sanitizeLogSQL(sqlStmt)})
-	if _, err := r.db.ExecContext(ctx, sqlStmt); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, sqlStmt); err != nil {
 		resp.Diagnostics.AddError("CREATE CONNECTION failed", err.Error())
 		return
 	}
@@ -137,18 +139,17 @@ func (r *ConnectionResource) Read(ctx context.Context, req resource.ReadRequest,
 
 	// Read back connection details from EXA_DBA_CONNECTIONS.
 	// CONNECTION_STRING and USER_NAME are exposed; password is not.
-	var connString sql.NullString
-	var userName sql.NullString
-	query := `SELECT CONNECTION_STRING, USER_NAME FROM EXA_DBA_CONNECTIONS WHERE CONNECTION_NAME = ?`
-	err := r.db.QueryRowContext(ctx, query, state.ID.ValueString()).Scan(&connString, &userName)
-	if err == sql.ErrNoRows {
-		resp.State.RemoveResource(ctx)
-		return
-	}
+	row, err := cachedRow(ctx, r.db, r.reads,
+		`SELECT CONNECTION_NAME, CONNECTION_STRING, USER_NAME FROM EXA_DBA_CONNECTIONS`, state.ID.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Read connection failed", err.Error())
 		return
 	}
+	if row == nil {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+	connString, userName := row[1], row[2]
 
 	// After import, name is empty - populate it from the ID
 	if state.Name.IsNull() || state.Name.ValueString() == "" {
@@ -200,7 +201,7 @@ func (r *ConnectionResource) Update(ctx context.Context, req resource.UpdateRequ
 		lockDelete()
 		stmt := fmt.Sprintf(`RENAME CONNECTION "%s" TO "%s"`, upOld, upNew)
 		tflog.Info(ctx, "Renaming connection", map[string]any{"sql": stmt})
-		_, err := r.db.ExecContext(ctx, stmt)
+		_, err := execWrite(ctx, r.db, r.reads, stmt)
 		if err == nil {
 			r.renames.Record(exasolclient.RenameConnection, upOld, upNew)
 		}
@@ -209,6 +210,7 @@ func (r *ConnectionResource) Update(ctx context.Context, req resource.UpdateRequ
 			resp.Diagnostics.AddError("RENAME CONNECTION failed", err.Error())
 			return
 		}
+		resp.Diagnostics.Append(keepRenameInState(ctx, &resp.State, types.StringValue(upNew), plan.Name)...)
 	}
 
 	// Check if connection properties changed
@@ -222,7 +224,7 @@ func (r *ConnectionResource) Update(ctx context.Context, req resource.UpdateRequ
 			return
 		}
 		tflog.Info(ctx, "Altering connection", map[string]any{"sql": sanitizeLogSQL(alter)})
-		if _, err := r.db.ExecContext(ctx, alter); err != nil {
+		if _, err := execWrite(ctx, r.db, r.reads, alter); err != nil {
 			resp.Diagnostics.AddError("ALTER CONNECTION failed", err.Error())
 			return
 		}
@@ -256,7 +258,7 @@ func (r *ConnectionResource) Delete(ctx context.Context, req resource.DeleteRequ
 
 	stmt := fmt.Sprintf(`DROP CONNECTION "%s"`, upName)
 	tflog.Info(ctx, "Dropping connection", map[string]any{"sql": stmt})
-	if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, stmt); err != nil {
 		resp.Diagnostics.AddError("DROP CONNECTION failed", err.Error())
 	}
 }

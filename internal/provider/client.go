@@ -66,7 +66,7 @@ func NewClient(ctx context.Context, c *ProviderConfig) (*Client, error) {
 		err = db.PingContext(attemptCtx)
 		cancel()
 		if err == nil {
-			return &Client{DB: db, Renames: exasolclient.NewRenameLog()}, nil
+			return &Client{DB: db, Renames: exasolclient.NewRenameLog(), Reads: exasolclient.NewReadCache()}, nil
 		}
 		if ctx.Err() != nil {
 			_ = db.Close()

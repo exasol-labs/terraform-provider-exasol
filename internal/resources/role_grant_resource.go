@@ -21,6 +21,7 @@ var _ resource.ResourceWithImportState = &RoleGrantResource{}
 // RoleGrantResource manages granting roles to users or other roles.
 type RoleGrantResource struct {
 	db      *sql.DB
+	reads   *exasolclient.ReadCache
 	renames *exasolclient.RenameLog
 }
 
@@ -63,6 +64,7 @@ func (r *RoleGrantResource) Configure(_ context.Context, req resource.ConfigureR
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.reads = c.Reads
 		r.renames = c.Renames
 	}
 }
@@ -80,6 +82,7 @@ func (r *RoleGrantResource) Create(ctx context.Context, req resource.CreateReque
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	defer lockGrantees(plan.Grantee.ValueString())()
 	if r.db == nil {
 		resp.Diagnostics.AddError("Database not configured", "Provider did not supply a database connection.")
 		return
@@ -105,7 +108,7 @@ func (r *RoleGrantResource) Create(ctx context.Context, req resource.CreateReque
 	}
 
 	tflog.Info(ctx, "Granting role", map[string]any{"sql": stmt})
-	if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, stmt); err != nil {
 		resp.Diagnostics.AddError("GRANT failed", err.Error())
 		return
 	}
@@ -130,17 +133,17 @@ func (r *RoleGrantResource) Read(ctx context.Context, req resource.ReadRequest, 
 	grantee := strings.ToUpper(state.Grantee.ValueString())
 
 	// Check if role grant exists in EXA_DBA_ROLE_PRIVS
-	query := `SELECT ADMIN_OPTION FROM EXA_DBA_ROLE_PRIVS WHERE GRANTED_ROLE = ? AND GRANTEE = ?`
-	var adminOption string
-	err := r.db.QueryRowContext(ctx, query, role, grantee).Scan(&adminOption)
-	if err == sql.ErrNoRows {
-		resp.State.RemoveResource(ctx)
-		return
-	}
+	row, err := cachedRow(ctx, r.db, r.reads,
+		`SELECT GRANTED_ROLE, GRANTEE, ADMIN_OPTION FROM EXA_DBA_ROLE_PRIVS`, role, grantee)
 	if err != nil {
 		resp.Diagnostics.AddError("Read role grant failed", err.Error())
 		return
 	}
+	if row == nil {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+	adminOption := row[2].String
 
 	// Set with_admin_option based on database value
 	// If database has TRUE, set to true. If database has FALSE, set to null.
@@ -168,6 +171,7 @@ func (r *RoleGrantResource) Update(ctx context.Context, req resource.UpdateReque
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	defer lockGranteesAndRenames(r.renames, plan.Grantee.ValueString(), state.Grantee.ValueString())()
 	if r.db == nil {
 		resp.Diagnostics.AddError("Database not configured", "Provider did not supply a database connection.")
 		return
@@ -213,7 +217,7 @@ func (r *RoleGrantResource) Update(ctx context.Context, req resource.UpdateReque
 			if oldExists {
 				revokeStmt := fmt.Sprintf(`REVOKE "%s" FROM "%s"`, curRole, curGrantee)
 				tflog.Info(ctx, "Revoking old role grant", map[string]any{"sql": revokeStmt})
-				if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+				if _, err := execWrite(ctx, r.db, r.reads, revokeStmt); err != nil {
 					resp.Diagnostics.AddError("REVOKE failed", err.Error())
 					return
 				}
@@ -229,7 +233,7 @@ func (r *RoleGrantResource) Update(ctx context.Context, req resource.UpdateReque
 		if newExists && newAdmin != wantAdmin {
 			revokeStmt := fmt.Sprintf(`REVOKE "%s" FROM "%s"`, newRole, newGrantee)
 			tflog.Info(ctx, "Revoking role to update admin option", map[string]any{"sql": revokeStmt})
-			if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+			if _, err := execWrite(ctx, r.db, r.reads, revokeStmt); err != nil {
 				resp.Diagnostics.AddError("REVOKE failed", err.Error())
 				return
 			}
@@ -241,7 +245,7 @@ func (r *RoleGrantResource) Update(ctx context.Context, req resource.UpdateReque
 				grantStmt += " WITH ADMIN OPTION"
 			}
 			tflog.Info(ctx, "Granting new role", map[string]any{"sql": grantStmt})
-			if _, err := r.db.ExecContext(ctx, grantStmt); err != nil {
+			if _, err := execWrite(ctx, r.db, r.reads, grantStmt); err != nil {
 				resp.Diagnostics.AddError("GRANT failed", err.Error())
 				return
 			}
@@ -253,7 +257,7 @@ func (r *RoleGrantResource) Update(ctx context.Context, req resource.UpdateReque
 
 		revokeStmt := fmt.Sprintf(`REVOKE "%s" FROM "%s"`, role, grantee)
 		tflog.Info(ctx, "Revoking role to update admin option", map[string]any{"sql": revokeStmt})
-		if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+		if _, err := execWrite(ctx, r.db, r.reads, revokeStmt); err != nil {
 			resp.Diagnostics.AddError("REVOKE failed", err.Error())
 			return
 		}
@@ -263,7 +267,7 @@ func (r *RoleGrantResource) Update(ctx context.Context, req resource.UpdateReque
 			grantStmt += " WITH ADMIN OPTION"
 		}
 		tflog.Info(ctx, "Re-granting role with updated admin option", map[string]any{"sql": grantStmt})
-		if _, err := r.db.ExecContext(ctx, grantStmt); err != nil {
+		if _, err := execWrite(ctx, r.db, r.reads, grantStmt); err != nil {
 			resp.Diagnostics.AddError("GRANT failed", err.Error())
 			return
 		}
@@ -297,6 +301,8 @@ func (r *RoleGrantResource) Delete(ctx context.Context, req resource.DeleteReque
 	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, grantee); ok {
 		grantee = current
 	}
+	// Lock the name the grant lives under now, too: a Create on it must wait.
+	defer lockGrantees(state.Grantee.ValueString(), grantee)()
 	// Already gone, e.g. the grantee was dropped: nothing to revoke.
 	exists, _, err := r.grantExists(ctx, role, grantee)
 	if err != nil {
@@ -309,7 +315,7 @@ func (r *RoleGrantResource) Delete(ctx context.Context, req resource.DeleteReque
 	stmt := fmt.Sprintf(`REVOKE "%s" FROM "%s"`, role, grantee)
 
 	tflog.Info(ctx, "Revoking role grant", map[string]any{"sql": stmt})
-	if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, stmt); err != nil {
 		resp.Diagnostics.AddError("REVOKE failed", err.Error())
 	}
 }

@@ -26,6 +26,7 @@ var _ resource.ResourceWithImportState = &ObjectPrivilegeResource{}
 // Object privileges are granted on schemas, tables, views, scripts, etc.
 type ObjectPrivilegeResource struct {
 	db      *sql.DB
+	reads   *exasolclient.ReadCache
 	renames *exasolclient.RenameLog
 }
 
@@ -76,6 +77,7 @@ func (r *ObjectPrivilegeResource) Configure(_ context.Context, req resource.Conf
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.reads = c.Reads
 		r.renames = c.Renames
 	}
 }
@@ -94,6 +96,7 @@ func (r *ObjectPrivilegeResource) Create(ctx context.Context, req resource.Creat
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	defer lockGrantees(plan.Grantee.ValueString())()
 	if r.db == nil {
 		resp.Diagnostics.AddError("Database not configured", "Provider did not supply a database connection.")
 		return
@@ -121,7 +124,7 @@ func (r *ObjectPrivilegeResource) Create(ctx context.Context, req resource.Creat
 		priv := strings.ToUpper(privilege)
 		stmt := fmt.Sprintf(`GRANT %s ON %s %s TO "%s"`, priv, objectType, objectName, grantee)
 		tflog.Info(ctx, "Granting object privilege", map[string]any{"sql": stmt})
-		if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+		if _, err := execWrite(ctx, r.db, r.reads, stmt); err != nil {
 			resp.Diagnostics.AddError(fmt.Sprintf("GRANT %s failed", priv), err.Error())
 			return
 		}
@@ -167,7 +170,7 @@ func (r *ObjectPrivilegeResource) Read(ctx context.Context, req resource.ReadReq
 	var foundPrivileges []string
 	for _, privilege := range privileges {
 		priv := strings.ToUpper(privilege)
-		exists, err := checkObjectPrivilegeExists(ctx, r.db, grantee, priv, objectType, objectName)
+		exists, err := cachedObjectPrivilegeExists(ctx, r.db, r.reads, grantee, priv, objectType, objectName)
 		if err != nil {
 			resp.Diagnostics.AddError("Read object privilege failed", err.Error())
 			return
@@ -207,6 +210,7 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	defer lockGranteesAndRenames(r.renames, plan.Grantee.ValueString(), state.Grantee.ValueString())()
 	if r.db == nil {
 		resp.Diagnostics.AddError("Database not configured", "Provider did not supply a database connection.")
 		return
@@ -321,7 +325,7 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 				}
 				revokeStmt := fmt.Sprintf(`REVOKE %s ON %s %s FROM "%s"`, priv, oldObjectType, qualify(curObject), curGrantee)
 				tflog.Info(ctx, "Revoking old object privilege", map[string]any{"sql": revokeStmt})
-				if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+				if _, err := execWrite(ctx, r.db, r.reads, revokeStmt); err != nil {
 					resp.Diagnostics.AddError(fmt.Sprintf("REVOKE %s failed", priv), err.Error())
 					return
 				}
@@ -346,7 +350,7 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 			}
 			grantStmt := fmt.Sprintf(`GRANT %s ON %s %s TO "%s"`, priv, newObjectType, newObjectName, newGrantee)
 			tflog.Info(ctx, "Granting new object privilege", map[string]any{"sql": grantStmt})
-			if _, err := r.db.ExecContext(ctx, grantStmt); err != nil {
+			if _, err := execWrite(ctx, r.db, r.reads, grantStmt); err != nil {
 				resp.Diagnostics.AddError(fmt.Sprintf("GRANT %s failed", priv), err.Error())
 				return
 			}
@@ -380,7 +384,7 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 			}
 			revokeStmt := fmt.Sprintf(`REVOKE %s ON %s %s FROM "%s"`, priv, newObjectType, qualify(lookupName), newGrantee)
 			tflog.Info(ctx, "Revoking removed privilege", map[string]any{"sql": revokeStmt})
-			if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+			if _, err := execWrite(ctx, r.db, r.reads, revokeStmt); err != nil {
 				resp.Diagnostics.AddError(fmt.Sprintf("REVOKE %s failed", priv), err.Error())
 				return
 			}
@@ -391,7 +395,7 @@ func (r *ObjectPrivilegeResource) Update(ctx context.Context, req resource.Updat
 			if !oldPrivSet[priv] {
 				grantStmt := fmt.Sprintf(`GRANT %s ON %s %s TO "%s"`, priv, newObjectType, newObjectName, newGrantee)
 				tflog.Info(ctx, "Granting new privilege", map[string]any{"sql": grantStmt})
-				if _, err := r.db.ExecContext(ctx, grantStmt); err != nil {
+				if _, err := execWrite(ctx, r.db, r.reads, grantStmt); err != nil {
 					resp.Diagnostics.AddError(fmt.Sprintf("GRANT %s failed", priv), err.Error())
 					return
 				}
@@ -426,6 +430,8 @@ func (r *ObjectPrivilegeResource) Delete(ctx context.Context, req resource.Delet
 	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, grantee); ok {
 		grantee = current
 	}
+	// Lock the name the grant lives under now, too: a Create on it must wait.
+	defer lockGrantees(state.Grantee.ValueString(), grantee)()
 	oldTarget, known := knownObjectTarget(ctx, req.Private)
 	if !known {
 		var err error
@@ -467,7 +473,7 @@ func (r *ObjectPrivilegeResource) Delete(ctx context.Context, req resource.Delet
 		}
 		stmt := fmt.Sprintf(`REVOKE %s ON %s %s FROM "%s"`, priv, objectType, objectName, grantee)
 		tflog.Info(ctx, "Revoking object privilege", map[string]any{"sql": stmt})
-		if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+		if _, err := execWrite(ctx, r.db, r.reads, stmt); err != nil {
 			resp.Diagnostics.AddError(fmt.Sprintf("REVOKE %s failed", priv), err.Error())
 		}
 	}
@@ -568,6 +574,32 @@ func checkObjectPrivilegeExists(ctx context.Context, db *sql.DB, grantee, privil
 		return false, err
 	}
 	return true, nil
+}
+
+// cachedObjectPrivilegeExists is checkObjectPrivilegeExists on the read cache,
+// for Read. It matches the same rows: OBJECT_SCHEMA only when objectName is
+// qualified, and for ALL any privilege, because Exasol may list ALL expanded.
+func cachedObjectPrivilegeExists(ctx context.Context, db *sql.DB, reads *exasolclient.ReadCache, grantee, privilege, objectType, objectName string) (bool, error) {
+	unquoted := strings.ReplaceAll(objectName, `"`, "")
+	schema, name, qualified := strings.Cut(unquoted, ".")
+	if !qualified {
+		name = unquoted
+	}
+	rows, err := reads.Rows(ctx, db,
+		`SELECT GRANTEE, OBJECT_TYPE, OBJECT_NAME, OBJECT_SCHEMA, PRIVILEGE FROM EXA_DBA_OBJ_PRIVS`,
+		grantee, objectType, name)
+	if err != nil {
+		return false, err
+	}
+	for _, row := range rows {
+		if qualified && (!row[3].Valid || row[3].String != schema) {
+			continue
+		}
+		if privilege == "ALL" || row[4].String == privilege {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // objectTargetKey stores the exact object a privilege was granted on (SCHEMA or

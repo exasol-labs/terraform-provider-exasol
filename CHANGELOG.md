@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.2] - 2026-10-27
+
+### Changed
+- Refresh reads each system view once per plan, refresh or import (per provider configuration) instead of once per resource. `terraform plan` sent one query per resource to `EXA_DBA_ROLE_PRIVS`, `EXA_DBA_SYS_PRIVS`, `EXA_DBA_OBJ_PRIVS`, `EXA_DBA_IMPERSONATION_PRIVS`, `EXA_DBA_CONNECTION_PRIVS`, `EXA_DBA_USERS`, `EXA_DBA_ROLES`, `EXA_DBA_CONNECTIONS` and `EXA_ALL_SCHEMAS`, and each query costs about the same however few rows it returns. The provider now loads each view on the first read and answers the other resources from memory. Every statement that changes the database clears these copies, so a later read sees the database again. Create, update and delete still query the database directly. `exasol_object_privilege` still checks the object once per resource when the exact object is not known yet (after an import, or on state from 0.2.x); it stores the object, so later plans skip that check. Measured on a local database with a copy of a production configuration (3,779 Exasol resources): 8,689 queries and 19 seconds per plan before, 10 queries and 4 seconds after, with the same plan, also after grants were revoked outside Terraform
+
+### Fixed
+- Grants to the same grantee no longer fail with "Transaction collision" (Exasol SQL error 40001) when Terraform runs them in parallel, for example many `exasol_user_impersonation_grant` resources with one grantee role. Exasol rolls back parallel GRANT and REVOKE statements on the same grantee; statements on different grantees do not collide. Grant creates now run one grantee at a time and stay parallel across grantees; grant updates and deletes stay serialized, as before. A statement that still collides, for example with another session, is run again up to 8 times, with at most about 9 seconds of waiting in total. This makes `-parallelism=1` unnecessary as a workaround
+- `exasol_schema` drops a schema it just created when setting its comment or owner fails. Before, the schema stayed outside Terraform state and the next apply failed with "already exists". The schema is dropped without `CASCADE`, so only an empty schema is removed
+- `exasol_schema`, `exasol_user` and `exasol_connection` keep the new name in state when a rename succeeds and a later step of the same update fails. Before, the next run did not find the object and planned to create it again
+
 ## [0.3.1] - 2026-10-26
 
 ### Added

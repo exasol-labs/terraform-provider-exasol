@@ -4,9 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math/rand/v2"
 	"strings"
+	"time"
 
 	"terraform-provider-exasol/internal/exasolclient"
+
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
 func qualify(obj string) string {
@@ -184,4 +191,62 @@ func objectExists(ctx context.Context, db *sql.DB, name string) (bool, error) {
 	// EXA_DBA_SCHEMAS lists every schema, independent of the provider user's
 	// access to it, like the other EXA_DBA_* views the provider uses.
 	return rowExists(ctx, db, `SELECT 1 FROM EXA_DBA_SCHEMAS WHERE SCHEMA_NAME = ?`, unquoted)
+}
+
+// cachedRow returns the first row of query whose leading columns equal key,
+// from the read cache, or nil when there is none. Only Read uses it: Create
+// and Update query directly, so an apply does not reload whole views.
+func cachedRow(ctx context.Context, db *sql.DB, reads *exasolclient.ReadCache, query string, key ...string) ([]sql.NullString, error) {
+	rows, err := reads.Rows(ctx, db, query, key...)
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	return rows[0], nil
+}
+
+// collisionRetries is how often execWrite runs a statement again after a
+// transaction collision. The waits add up to at most about 9 seconds.
+const collisionRetries = 8
+
+// execWrite runs a statement that changes the database and then clears the
+// read cache, so a later Read does not see rows from before the change.
+//
+// Parallel GRANT, REVOKE and DROP statements on the same user or role can
+// collide in Exasol (SQL error 40001). Exasol rolls the colliding statement
+// back completely, so execWrite runs it again after a random wait ("full
+// jitter": anywhere up to an exponential limit), which spreads the retries of
+// statements that collided with each other.
+func execWrite(ctx context.Context, db *sql.DB, reads *exasolclient.ReadCache, query string, args ...any) (sql.Result, error) {
+	defer reads.Clear()
+	for attempt := 0; ; attempt++ {
+		res, err := db.ExecContext(ctx, query, args...)
+		if err == nil || attempt == collisionRetries || !isTransactionCollision(err) {
+			return res, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%w (retry stopped: %v)", err, ctx.Err())
+		case <-time.After(collisionWait(attempt)):
+		}
+	}
+}
+
+// collisionWait is the wait before retry attempt+1. Tests replace it.
+var collisionWait = func(attempt int) time.Duration {
+	return 10*time.Millisecond + rand.N(min(2*time.Second, 100*time.Millisecond<<attempt))
+}
+
+// isTransactionCollision reports whether err is Exasol's SQL error 40001. The
+// driver only returns it as text: "... SQL error code '40001' and message ...".
+func isTransactionCollision(err error) bool {
+	return strings.Contains(err.Error(), "SQL error code '40001'")
+}
+
+// keepRenameInState stores the new name in state right after a rename. When a
+// later step of the same Update fails, Terraform keeps this state, and the next
+// run finds the object under its new name instead of planning to create it.
+func keepRenameInState(ctx context.Context, state *tfsdk.State, id, name types.String) diag.Diagnostics {
+	diags := state.SetAttribute(ctx, path.Root("id"), id)
+	diags.Append(state.SetAttribute(ctx, path.Root("name"), name)...)
+	return diags
 }

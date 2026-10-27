@@ -21,6 +21,7 @@ var _ resource.ResourceWithImportState = &ConnectionGrantResource{}
 // ConnectionGrantResource manages GRANT CONNECTION ... TO ... statements.
 type ConnectionGrantResource struct {
 	db      *sql.DB
+	reads   *exasolclient.ReadCache
 	renames *exasolclient.RenameLog
 }
 
@@ -60,6 +61,7 @@ func (r *ConnectionGrantResource) Configure(_ context.Context, req resource.Conf
 	}
 	if c, ok := req.ProviderData.(*exasolclient.Client); ok {
 		r.db = c.DB
+		r.reads = c.Reads
 		r.renames = c.Renames
 	}
 }
@@ -76,6 +78,7 @@ func (r *ConnectionGrantResource) Create(ctx context.Context, req resource.Creat
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	defer lockGrantees(plan.Grantee.ValueString())()
 	if r.db == nil {
 		resp.Diagnostics.AddError("Database not configured", "Provider did not supply a database connection.")
 		return
@@ -99,7 +102,7 @@ func (r *ConnectionGrantResource) Create(ctx context.Context, req resource.Creat
 	// GRANT CONNECTION connection_name TO grantee
 	sqlStmt := fmt.Sprintf(`GRANT CONNECTION "%s" TO "%s"`, connection, grantee)
 	tflog.Info(ctx, "Granting connection access", map[string]any{"sql": sqlStmt})
-	if _, err := r.db.ExecContext(ctx, sqlStmt); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, sqlStmt); err != nil {
 		resp.Diagnostics.AddError("GRANT CONNECTION failed", err.Error())
 		return
 	}
@@ -124,16 +127,15 @@ func (r *ConnectionGrantResource) Read(ctx context.Context, req resource.ReadReq
 
 	// Check if the grant exists in EXA_DBA_CONNECTION_PRIVS
 	// Connection grants are tracked separately in the connection privileges view
-	query := `SELECT 1 FROM EXA_DBA_CONNECTION_PRIVS WHERE GRANTED_CONNECTION = ? AND GRANTEE = ?`
-	var dummy int
-	err := r.db.QueryRowContext(ctx, query, connection, grantee).Scan(&dummy)
-	if err == sql.ErrNoRows {
-		// Grant doesn't exist, remove from state
-		resp.State.RemoveResource(ctx)
-		return
-	}
+	row, err := cachedRow(ctx, r.db, r.reads,
+		`SELECT GRANTED_CONNECTION, GRANTEE FROM EXA_DBA_CONNECTION_PRIVS`, connection, grantee)
 	if err != nil {
 		resp.Diagnostics.AddError("Read connection grant failed", err.Error())
+		return
+	}
+	if row == nil {
+		// Grant doesn't exist, remove from state
+		resp.State.RemoveResource(ctx)
 		return
 	}
 
@@ -156,6 +158,7 @@ func (r *ConnectionGrantResource) Update(ctx context.Context, req resource.Updat
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	defer lockGranteesAndRenames(r.renames, plan.Grantee.ValueString(), state.Grantee.ValueString())()
 	if r.db == nil {
 		resp.Diagnostics.AddError("Database not configured", "Provider did not supply a database connection.")
 		return
@@ -201,7 +204,7 @@ func (r *ConnectionGrantResource) Update(ctx context.Context, req resource.Updat
 			if oldExists {
 				revokeStmt := fmt.Sprintf(`REVOKE CONNECTION "%s" FROM "%s"`, curConnection, curGrantee)
 				tflog.Info(ctx, "Revoking old connection grant", map[string]any{"sql": revokeStmt})
-				if _, err := r.db.ExecContext(ctx, revokeStmt); err != nil {
+				if _, err := execWrite(ctx, r.db, r.reads, revokeStmt); err != nil {
 					resp.Diagnostics.AddError("REVOKE CONNECTION failed", err.Error())
 					return
 				}
@@ -216,7 +219,7 @@ func (r *ConnectionGrantResource) Update(ctx context.Context, req resource.Updat
 		if !newExists {
 			grantStmt := fmt.Sprintf(`GRANT CONNECTION "%s" TO "%s"`, newConnection, newGrantee)
 			tflog.Info(ctx, "Granting new connection access", map[string]any{"sql": grantStmt})
-			if _, err := r.db.ExecContext(ctx, grantStmt); err != nil {
+			if _, err := execWrite(ctx, r.db, r.reads, grantStmt); err != nil {
 				resp.Diagnostics.AddError("GRANT CONNECTION failed", err.Error())
 				return
 			}
@@ -259,6 +262,8 @@ func (r *ConnectionGrantResource) Delete(ctx context.Context, req resource.Delet
 	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, grantee); ok {
 		grantee = current
 	}
+	// Lock the name the grant lives under now, too: a Create on it must wait.
+	defer lockGrantees(state.Grantee.ValueString(), grantee)()
 	// Already gone, e.g. the grantee was dropped: nothing to revoke.
 	exists, err := r.grantExists(ctx, connection, grantee)
 	if err != nil {
@@ -272,7 +277,7 @@ func (r *ConnectionGrantResource) Delete(ctx context.Context, req resource.Delet
 	// REVOKE CONNECTION connection_name FROM grantee
 	sqlStmt := fmt.Sprintf(`REVOKE CONNECTION "%s" FROM "%s"`, connection, grantee)
 	tflog.Info(ctx, "Revoking connection access", map[string]any{"sql": sqlStmt})
-	if _, err := r.db.ExecContext(ctx, sqlStmt); err != nil {
+	if _, err := execWrite(ctx, r.db, r.reads, sqlStmt); err != nil {
 		resp.Diagnostics.AddError("REVOKE CONNECTION failed", err.Error())
 	}
 }
