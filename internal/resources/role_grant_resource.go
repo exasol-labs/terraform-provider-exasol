@@ -171,7 +171,7 @@ func (r *RoleGrantResource) Update(ctx context.Context, req resource.UpdateReque
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	defer lockGrantees(plan.Grantee.ValueString(), state.Grantee.ValueString())()
+	defer lockGranteesAndRenames(r.renames, plan.Grantee.ValueString(), state.Grantee.ValueString())()
 	if r.db == nil {
 		resp.Diagnostics.AddError("Database not configured", "Provider did not supply a database connection.")
 		return

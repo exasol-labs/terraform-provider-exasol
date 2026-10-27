@@ -3,6 +3,7 @@ package exasolclient
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -15,7 +16,7 @@ import (
 // writes in another provider instance (the apply walk configures a new one),
 // so Clear on every write is a safeguard for a Read after a write.
 //
-// ponytail: whole views are held in memory, so a database with hundreds of
+// Limit: whole views are held in memory, so a database with hundreds of
 // thousands of object grants loads all of them even for a -target plan. Load
 // only above a resource count, or filter the view, if that ever matters.
 type ReadCache struct {
@@ -39,14 +40,19 @@ func NewReadCache() *ReadCache { return &ReadCache{views: map[string]*cachedView
 //
 // The first caller of a view loads it while the others wait. A failed load is
 // kept until Clear, so parallel Reads fail with that error instead of each
-// loading the view again.
+// loading the view again; a cancelled or timed-out load is not kept, because
+// it belongs to the caller's context. A nil cache loads the view on every call.
 func (c *ReadCache) Rows(ctx context.Context, db *sql.DB, query string, key ...string) ([][]sql.NullString, error) {
+	if c == nil {
+		rows, err := loadView(ctx, db, query, len(key))
+		return rows[strings.Join(key, "\x00")], err
+	}
 	v := c.view(fmt.Sprint(len(key), "\x00", query))
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if !v.loaded {
 		v.rows, v.err = loadView(ctx, db, query, len(key))
-		v.loaded = true
+		v.loaded = !errors.Is(v.err, context.Canceled) && !errors.Is(v.err, context.DeadlineExceeded)
 	}
 	if v.err != nil {
 		return nil, v.err

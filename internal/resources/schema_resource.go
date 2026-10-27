@@ -180,7 +180,9 @@ func (r *SchemaResource) Create(ctx context.Context, req resource.CreateRequest,
 		tflog.Info(ctx, "Dropping schema after failed create", map[string]any{"sql": dropStmt})
 		// The create may have failed because ctx was cancelled; drop anyway.
 		dropCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		lockDelete()
 		_, dropErr := execWrite(dropCtx, r.db, r.reads, dropStmt)
+		unlockDelete()
 		cancel()
 		if dropErr != nil {
 			detail += fmt.Sprintf("\n\nThe new schema could not be dropped again: %s\nDrop or import it before the next apply.", dropErr)

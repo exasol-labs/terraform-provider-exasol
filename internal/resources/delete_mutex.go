@@ -4,6 +4,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+
+	"terraform-provider-exasol/internal/exasolclient"
 )
 
 // deleteMutex serializes all delete operations, and grant updates that revoke,
@@ -23,6 +25,18 @@ func lockDelete() {
 // unlockDelete unlocks the global delete mutex.
 func unlockDelete() {
 	deleteMutex.Unlock()
+}
+
+// lockGranteesAndRenames locks the grantees and, for each one renamed in this
+// run, the name its previous grants live under now (see resolveEndpoint).
+func lockGranteesAndRenames(renames *exasolclient.RenameLog, names ...string) func() {
+	all := slices.Clone(names)
+	for _, n := range names {
+		if current, ok := renames.Lookup(exasolclient.RenamePrincipal, n); ok {
+			all = append(all, current)
+		}
+	}
+	return lockGrantees(all...)
 }
 
 // granteeLocks holds one mutex per grantee name.
