@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"testing"
+	"time"
 
 	"terraform-provider-exasol/internal/exasolclient"
 )
@@ -56,3 +57,34 @@ type connector struct{ d *collidingDriver }
 
 func (c connector) Connect(context.Context) (driver.Conn, error) { return collidingConn(c), nil }
 func (c connector) Driver() driver.Driver                        { return c.d }
+
+func TestLockGrantees(t *testing.T) {
+	done := make(chan struct{})
+	go func() {
+		// The same grantee in two spellings must not lock itself.
+		unlock := lockGrantees("hub", "HUB", "Other")
+		// A different grantee is not blocked by it.
+		lockGrantees("THIRD")()
+		unlock()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lockGrantees deadlocked")
+	}
+
+	unlock := lockGrantees("HUB")
+	acquired := make(chan struct{})
+	go func() {
+		lockGrantees("hub")()
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("second lock on the same grantee did not wait")
+	case <-time.After(100 * time.Millisecond):
+	}
+	unlock()
+	<-acquired
+}

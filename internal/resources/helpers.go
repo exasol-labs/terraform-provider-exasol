@@ -205,15 +205,17 @@ func cachedRow(ctx context.Context, db *sql.DB, reads *exasolclient.ReadCache, q
 }
 
 // collisionRetries is how often execWrite runs a statement again after a
-// transaction collision. The waits add up to about 3 seconds.
-const collisionRetries = 5
+// transaction collision. The waits add up to at most about 9 seconds.
+const collisionRetries = 8
 
 // execWrite runs a statement that changes the database and then clears the
 // read cache, so a later Read does not see rows from before the change.
 //
-// Parallel GRANT, REVOKE and DROP statements can collide in Exasol (SQL error
-// 40001). Exasol rolls the colliding statement back completely, so execWrite
-// runs it again after a short random wait.
+// Parallel GRANT, REVOKE and DROP statements on the same user or role can
+// collide in Exasol (SQL error 40001). Exasol rolls the colliding statement
+// back completely, so execWrite runs it again after a random wait ("full
+// jitter": anywhere up to an exponential limit), which spreads the retries of
+// statements that collided with each other.
 func execWrite(ctx context.Context, db *sql.DB, reads *exasolclient.ReadCache, query string, args ...any) (sql.Result, error) {
 	defer reads.Clear()
 	for attempt := 0; ; attempt++ {
@@ -221,7 +223,7 @@ func execWrite(ctx context.Context, db *sql.DB, reads *exasolclient.ReadCache, q
 		if err == nil || attempt == collisionRetries || !isTransactionCollision(err) {
 			return res, err
 		}
-		wait := 100*time.Millisecond<<attempt + rand.N(100*time.Millisecond)
+		wait := 10*time.Millisecond + rand.N(min(2*time.Second, 100*time.Millisecond<<attempt))
 		select {
 		case <-ctx.Done():
 			return nil, err
