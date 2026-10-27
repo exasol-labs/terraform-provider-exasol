@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.3.2] - 2026-10-26
+## [0.3.2] - 2026-10-27
 
 ### Changed
 - Refresh reads each system view once per plan, refresh or import (per provider configuration) instead of once per resource. `terraform plan` sent one query per resource to `EXA_DBA_ROLE_PRIVS`, `EXA_DBA_SYS_PRIVS`, `EXA_DBA_OBJ_PRIVS`, `EXA_DBA_IMPERSONATION_PRIVS`, `EXA_DBA_CONNECTION_PRIVS`, `EXA_DBA_USERS`, `EXA_DBA_ROLES`, `EXA_DBA_CONNECTIONS` and `EXA_ALL_SCHEMAS`, and each query costs about the same however few rows it returns. The provider now loads each view on the first read and answers the other resources from memory. Every statement that changes the database clears these copies, so a later read sees the database again. Create, update and delete still query the database directly. `exasol_object_privilege` still checks the object once per resource when the exact object is not known yet (after an import, or on state from 0.2.x); it stores the object, so later plans skip that check. Measured on a local database with a copy of a production configuration (3,779 Exasol resources): 8,689 queries and 19 seconds per plan before, 10 queries and 4 seconds after, with the same plan, also after grants were revoked outside Terraform
