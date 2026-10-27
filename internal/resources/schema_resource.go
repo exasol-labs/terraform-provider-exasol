@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 	"unicode/utf8"
 
 	"terraform-provider-exasol/internal/exasolclient"
@@ -116,9 +117,6 @@ func (r *SchemaResource) configureNewSchema(ctx context.Context, schemaName stri
 	// Transfer ownership if specified
 	if !plan.Owner.IsNull() && !plan.Owner.IsUnknown() {
 		owner := plan.Owner.ValueString()
-		if !isValidIdentifier(owner) {
-			return "Invalid owner name", fmt.Errorf("owner name %q contains invalid characters", owner)
-		}
 		alterStmt := fmt.Sprintf(`ALTER SCHEMA "%s" CHANGE OWNER "%s"`, schemaName, owner)
 		tflog.Info(ctx, "Transferring schema ownership", map[string]any{"sql": alterStmt})
 		if _, err := execWrite(ctx, r.db, r.reads, alterStmt); err != nil {
@@ -160,6 +158,12 @@ func (r *SchemaResource) Create(ctx context.Context, req resource.CreateRequest,
 		return
 	}
 
+	if !plan.Owner.IsNull() && !plan.Owner.IsUnknown() && !isValidIdentifier(plan.Owner.ValueString()) {
+		resp.Diagnostics.AddError("Invalid owner name",
+			fmt.Sprintf("Owner name %q contains invalid characters.", plan.Owner.ValueString()))
+		return
+	}
+
 	sqlStmt := fmt.Sprintf(`CREATE SCHEMA "%s"`, schemaName)
 	tflog.Info(ctx, "Creating schema", map[string]any{"sql": sqlStmt})
 	if _, err := execWrite(ctx, r.db, r.reads, sqlStmt); err != nil {
@@ -174,7 +178,11 @@ func (r *SchemaResource) Create(ctx context.Context, req resource.CreateRequest,
 		detail := err.Error()
 		dropStmt := fmt.Sprintf(`DROP SCHEMA "%s"`, escapeIdentifierLiteral(schemaName))
 		tflog.Info(ctx, "Dropping schema after failed create", map[string]any{"sql": dropStmt})
-		if _, dropErr := execWrite(ctx, r.db, r.reads, dropStmt); dropErr != nil {
+		// The create may have failed because ctx was cancelled; drop anyway.
+		dropCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		_, dropErr := execWrite(dropCtx, r.db, r.reads, dropStmt)
+		cancel()
+		if dropErr != nil {
 			detail += fmt.Sprintf("\n\nThe new schema could not be dropped again: %s\nDrop or import it before the next apply.", dropErr)
 		}
 		resp.Diagnostics.AddError(summary, detail)

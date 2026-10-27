@@ -32,7 +32,7 @@ var granteeLocks sync.Map
 // function: defer lockGrantees(a, b)(). Parallel GRANT and REVOKE statements on
 // the same grantee collide in Exasol (40001); statements on different grantees
 // do not, so grants to different grantees still run in parallel. Names are
-// locked in sorted order, so two calls never wait for each other. Update and
+// locked in sorted order, so two calls cannot deadlock. Update and
 // Delete take it after lockDelete, Create without it.
 func lockGrantees(names ...string) func() {
 	keys := make([]string, 0, len(names))

@@ -34,14 +34,14 @@ func NewReadCache() *ReadCache { return &ReadCache{views: map[string]*cachedView
 
 // Rows returns the rows of query whose first len(key) columns equal key, like
 // "WHERE col1 = ? AND col2 = ?" would. A NULL in a key column matches nothing,
-// as in SQL. Every call with the same query must pass the same number of keys.
+// as in SQL. Calls with another number of keys use their own copy of the view.
 // The rows are shared with other callers and must not be modified.
 //
 // The first caller of a view loads it while the others wait. A failed load is
 // kept until Clear, so parallel Reads fail with that error instead of each
 // loading the view again.
 func (c *ReadCache) Rows(ctx context.Context, db *sql.DB, query string, key ...string) ([][]sql.NullString, error) {
-	v := c.view(query)
+	v := c.view(fmt.Sprint(len(key), "\x00", query))
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if !v.loaded {
@@ -54,19 +54,20 @@ func (c *ReadCache) Rows(ctx context.Context, db *sql.DB, query string, key ...s
 	return v.rows[strings.Join(key, "\x00")], nil
 }
 
-func (c *ReadCache) view(query string) *cachedView {
+func (c *ReadCache) view(id string) *cachedView {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	v, ok := c.views[query]
+	v, ok := c.views[id]
 	if !ok {
 		v = &cachedView{}
-		c.views[query] = v
+		c.views[id] = v
 	}
 	return v
 }
 
-// Clear drops all cached views. A load still running fills a view that is no
-// longer in the cache, so its rows are never used.
+// Clear drops all cached views. A load running during Clear fills a view that
+// is no longer in the cache, so its rows only reach callers that asked for the
+// view before Clear.
 func (c *ReadCache) Clear() {
 	if c == nil {
 		return

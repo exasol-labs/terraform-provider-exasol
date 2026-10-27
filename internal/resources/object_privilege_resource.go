@@ -418,7 +418,6 @@ func (r *ObjectPrivilegeResource) Delete(ctx context.Context, req resource.Delet
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	defer lockGrantees(state.Grantee.ValueString())()
 	if r.db == nil {
 		resp.Diagnostics.AddError("Database not configured", "Provider did not supply a database connection.")
 		return
@@ -431,6 +430,8 @@ func (r *ObjectPrivilegeResource) Delete(ctx context.Context, req resource.Delet
 	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, grantee); ok {
 		grantee = current
 	}
+	// Lock the name the grant lives under now, too: a Create on it must wait.
+	defer lockGrantees(state.Grantee.ValueString(), grantee)()
 	oldTarget, known := knownObjectTarget(ctx, req.Private)
 	if !known {
 		var err error

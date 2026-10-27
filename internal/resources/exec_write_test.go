@@ -32,6 +32,8 @@ func (c collidingConn) ExecContext(context.Context, string, []driver.NamedValue)
 }
 
 func TestExecWriteRetriesCollision(t *testing.T) {
+	defer func(w func(int) time.Duration) { collisionWait = w }(collisionWait)
+	collisionWait = func(int) time.Duration { return 0 }
 	for _, tc := range []struct {
 		name      string
 		fail      int

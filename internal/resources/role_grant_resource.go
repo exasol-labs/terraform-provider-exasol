@@ -287,7 +287,6 @@ func (r *RoleGrantResource) Delete(ctx context.Context, req resource.DeleteReque
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	defer lockGrantees(state.Grantee.ValueString())()
 	if r.db == nil {
 		resp.Diagnostics.AddError("Database not configured", "Provider did not supply a database connection.")
 		return
@@ -302,6 +301,8 @@ func (r *RoleGrantResource) Delete(ctx context.Context, req resource.DeleteReque
 	if current, ok := r.renames.Lookup(exasolclient.RenamePrincipal, grantee); ok {
 		grantee = current
 	}
+	// Lock the name the grant lives under now, too: a Create on it must wait.
+	defer lockGrantees(state.Grantee.ValueString(), grantee)()
 	// Already gone, e.g. the grantee was dropped: nothing to revoke.
 	exists, _, err := r.grantExists(ctx, role, grantee)
 	if err != nil {

@@ -223,13 +223,17 @@ func execWrite(ctx context.Context, db *sql.DB, reads *exasolclient.ReadCache, q
 		if err == nil || attempt == collisionRetries || !isTransactionCollision(err) {
 			return res, err
 		}
-		wait := 10*time.Millisecond + rand.N(min(2*time.Second, 100*time.Millisecond<<attempt))
 		select {
 		case <-ctx.Done():
-			return nil, err
-		case <-time.After(wait):
+			return nil, fmt.Errorf("%w (retry stopped: %v)", err, ctx.Err())
+		case <-time.After(collisionWait(attempt)):
 		}
 	}
+}
+
+// collisionWait is the wait before retry attempt+1. Tests replace it.
+var collisionWait = func(attempt int) time.Duration {
+	return 10*time.Millisecond + rand.N(min(2*time.Second, 100*time.Millisecond<<attempt))
 }
 
 // isTransactionCollision reports whether err is Exasol's SQL error 40001. The
