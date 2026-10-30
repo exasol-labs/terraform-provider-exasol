@@ -81,7 +81,7 @@ make test-integration  # Requires running Exasol database
 make install-local     # Install for local Terraform testing
 ```
 
-Requires Go 1.25+, Terraform 1.0+, and Make.
+Requires Go 1.27.3+, Terraform 1.0+, and Make.
 
 ## License
 
