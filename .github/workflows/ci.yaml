@@ -8,9 +8,6 @@ on:
   pull_request:
     branches: [ main ]
 
-env:
-  GO_VERSION: '1.25'
-
 jobs:
   test:
     name: Test
@@ -26,7 +23,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: go.mod
 
       - name: Cache Go modules
         uses: actions/cache@v5
@@ -51,6 +48,19 @@ jobs:
       - name: Build
         run: make build
 
+      # Fails on known vulnerabilities that the provider code can reach, in
+      # dependencies and in the Go version from go.mod. Release depends on
+      # this job. A new Go advisory turns CI red until go.mod is bumped.
+      # Checked per GOOS that goreleaser ships; installed first because
+      # `GOOS=x go run` would cross-compile govulncheck itself.
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          for os in linux windows darwin freebsd; do
+            echo "== GOOS=$os"
+            GOOS=$os "$(go env GOPATH)/bin/govulncheck" ./...
+          done
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v4
         with:
@@ -74,7 +84,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: go.mod
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
@@ -110,7 +120,7 @@ jobs:
       - uses: actions/setup-go@v6
         if: steps.check.outputs.skip == 'false'
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: go.mod
 
       - name: Create tag
         if: steps.check.outputs.skip == 'false'
@@ -134,7 +144,7 @@ jobs:
       - name: Import GPG key
         id: import_gpg
         if: steps.check.outputs.skip == 'false'
-        uses: crazy-max/ghaction-import-gpg@v6
+        uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32126055eeae86ba74ec # v6.3.0
         with:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
           passphrase: ${{ secrets.GPG_PASSPHRASE }}
@@ -143,9 +153,9 @@ jobs:
 
       - name: Run goreleaser
         if: steps.check.outputs.skip == 'false'
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
-          version: latest
+          version: '~> v2'
           args: release --clean --release-notes /tmp/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
