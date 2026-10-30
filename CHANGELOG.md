@@ -12,7 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - CI reads the Go version from `go.mod` (`go-version-file`) instead of a separate `GO_VERSION` value, so CI and release builds always use the version that `go.mod` requires
-- CI runs `govulncheck` v1.9.0 in the test job. A known vulnerability that the provider code can reach, in a dependency or in the Go version, fails the build, and the release job does not run
+- CI runs `govulncheck` v1.9.0 in the test job, once for each released operating system (Linux, Windows, macOS, FreeBSD). A known vulnerability that the provider code can reach, in a dependency or in the Go version, fails the build, and the release job does not run
 
 ## [0.3.2] - 2026-10-27
 

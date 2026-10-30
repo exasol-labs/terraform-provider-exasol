@@ -51,8 +51,15 @@ jobs:
       # Fails on known vulnerabilities that the provider code can reach, in
       # dependencies and in the Go version from go.mod. Release depends on
       # this job. A new Go advisory turns CI red until go.mod is bumped.
+      # Checked per GOOS that goreleaser ships; installed first because
+      # `GOOS=x go run` would cross-compile govulncheck itself.
       - name: Run govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          for os in linux windows darwin freebsd; do
+            echo "== GOOS=$os"
+            GOOS=$os "$(go env GOPATH)/bin/govulncheck" ./...
+          done
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v4
