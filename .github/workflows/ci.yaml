@@ -70,7 +70,7 @@ jobs:
         run: make docs-validate
 
       - name: Upload coverage reports
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         if: success()
 
   lint:
