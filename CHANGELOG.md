@@ -13,7 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - CI reads the Go version from `go.mod` (`go-version-file`) instead of a separate `GO_VERSION` value, so CI and release builds always use the version that `go.mod` requires
 - CI runs `govulncheck` v1.9.0 in the test job, once for each released operating system (Linux, Windows, macOS, FreeBSD). A known vulnerability that the provider code can reach, in a dependency or in the Go version, fails the build, and the release job does not run
-- The release job uses `crazy-max/ghaction-import-gpg` and `goreleaser/goreleaser-action` pinned to a commit SHA instead of a version tag. This job holds the GPG signing key, and a moved tag can no longer change the code that runs with it. Dependabot now opens weekly update PRs for GitHub Actions (including these pins) and Go modules
+- The release job uses `crazy-max/ghaction-import-gpg` and `goreleaser/goreleaser-action` pinned to a commit SHA instead of a version tag. This job holds the GPG signing key, and a moved tag can no longer change the code that runs with it. Dependabot now opens one grouped update PR per week for GitHub Actions (including these pins) and one for Go modules
+- Update `github.com/exasol/exasol-driver-go` from v1.0.16 to v1.2.0 (adds local Parquet import, which the provider does not use; no change to connection or TLS handling), `github.com/hashicorp/terraform-plugin-log` from v0.10.0 to v0.11.0 and `github.com/hashicorp/terraform-plugin-testing` from v1.15.0 to v1.16.0
+- Update CI actions: `actions/checkout` v7, `actions/setup-go` v7, `actions/cache` v6, `codecov/codecov-action` v7 and `crazy-max/ghaction-import-gpg` v7.0.0 (Node 24 runtime)
 
 ## [0.3.2] - 2026-10-27
 

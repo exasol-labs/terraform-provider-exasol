@@ -1,10 +1,17 @@
 version: 2
 updates:
+  # One grouped PR per ecosystem per week instead of one PR per dependency.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
   - package-ecosystem: gomod
     directory: /
     schedule:
       interval: weekly
+    groups:
+      go-modules:
+        patterns: ["*"]
