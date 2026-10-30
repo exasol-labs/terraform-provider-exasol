@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - CI reads the Go version from `go.mod` (`go-version-file`) instead of a separate `GO_VERSION` value, so CI and release builds always use the version that `go.mod` requires
 - CI runs `govulncheck` v1.9.0 in the test job, once for each released operating system (Linux, Windows, macOS, FreeBSD). A known vulnerability that the provider code can reach, in a dependency or in the Go version, fails the build, and the release job does not run
+- The release job uses `crazy-max/ghaction-import-gpg` and `goreleaser/goreleaser-action` pinned to a commit SHA instead of a version tag. This job holds the GPG signing key, and a moved tag can no longer change the code that runs with it. Dependabot now opens weekly update PRs for GitHub Actions (including these pins) and Go modules
 
 ## [0.3.2] - 2026-10-27
 
