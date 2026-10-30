@@ -141,6 +141,9 @@ jobs:
       # Tagging and releasing happen in this single job, so we never rely on a
       # tag push triggering another workflow (GITHUB_TOKEN-pushed tags do not
       # trigger workflows). The fingerprint feeds goreleaser's signs block.
+      # The two third-party actions below are pinned to a commit SHA because
+      # they run with the GPG signing key; a moved tag cannot change them.
+      # Other actions use readable version tags. Dependabot updates both.
       - name: Import GPG key
         id: import_gpg
         if: steps.check.outputs.skip == 'false'
