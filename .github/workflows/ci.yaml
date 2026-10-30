@@ -18,15 +18,15 @@ jobs:
       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
       - name: Cache Go modules
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/go/pkg/mod
           key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
@@ -70,7 +70,7 @@ jobs:
         run: make docs-validate
 
       - name: Upload coverage reports
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         if: success()
 
   lint:
@@ -81,8 +81,8 @@ jobs:
       github.event_name == 'push' ||
       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: golangci-lint
@@ -98,7 +98,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -117,7 +117,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         if: steps.check.outputs.skip == 'false'
         with:
           go-version-file: go.mod
@@ -141,10 +141,13 @@ jobs:
       # Tagging and releasing happen in this single job, so we never rely on a
       # tag push triggering another workflow (GITHUB_TOKEN-pushed tags do not
       # trigger workflows). The fingerprint feeds goreleaser's signs block.
+      # The two third-party actions below are pinned to a commit SHA because
+      # they run with the GPG signing key; a moved tag cannot change them.
+      # Other actions use readable version tags. Dependabot updates both.
       - name: Import GPG key
         id: import_gpg
         if: steps.check.outputs.skip == 'false'
-        uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32126055eeae86ba74ec # v6.3.0
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
         with:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
           passphrase: ${{ secrets.GPG_PASSPHRASE }}
