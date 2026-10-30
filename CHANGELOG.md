@@ -7,12 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [0.3.3] - 2026-10-30
 
 ### Security
-- Build with Go 1.27.3 instead of Go 1.25. Go 1.25 does not receive the fix for GO-2026-6809 (CVE-2026-111943): `crypto/x509` in Go 1.27.3 and 1.26.10 rejects certificate chains that contain one of eight compromised eMudhra intermediate CA keys. The provider uses `crypto/x509` to check the database server certificate when `validate_server_certificate = true`. The Go upgrade also fixes 12 other standard library advisories in `net/http`, `crypto/tls`, `net/textproto`, `net/http/httputil` and `html/template` (GO-2026-6599 to GO-2026-6617)
-- Update `golang.org/x/net` from v0.58.0 to v0.62.0 (GO-2026-6603, GO-2026-6610, GO-2026-6611, GO-2026-6612, GO-2026-6617, GO-2026-6860, GO-2026-6866). `govulncheck -mode=binary` on the v0.3.2 release binary reported 15 advisories; on the new build it reports none
+- Build with Go 1.27.3 instead of Go 1.25. Go 1.25 does not receive the fix for GO-2026-6809 (CVE-2026-111943): `crypto/x509` in Go 1.27.3 and 1.26.10 rejects certificate chains that contain one of eight compromised eMudhra intermediate CA keys. The provider uses `crypto/x509` to check the database server certificate when `validate_server_certificate = true`. The Go upgrade also fixes 12 other standard library advisories in `net/http`, `crypto/tls`, `net/textproto`, `net/http/httputil` and `html/template` (GO-2026-6599, GO-2026-6600, GO-2026-6603, GO-2026-6605, GO-2026-6607, GO-2026-6608, GO-2026-6609, GO-2026-6610, GO-2026-6611, GO-2026-6612, GO-2026-6613, GO-2026-6617)
+- Update `golang.org/x/net` from v0.58.0 to v0.62.0 (GO-2026-6860, GO-2026-6866; the HTTP/2 advisories GO-2026-6603, GO-2026-6610, GO-2026-6611, GO-2026-6612 and GO-2026-6617 above also apply to `golang.org/x/net`). `govulncheck -mode=binary` on the v0.3.2 release binary reported 15 unique advisories; on the new build it reports none
 
 ### Changed
 - CI reads the Go version from `go.mod` (`go-version-file`) instead of a separate `GO_VERSION` value, so CI and release builds always use the version that `go.mod` requires
-- CI runs `govulncheck` in the test job. A known vulnerability in a dependency or in the Go version fails the build, and the release job does not run
+- CI runs `govulncheck` v1.9.0 in the test job. A known vulnerability that the provider code can reach, in a dependency or in the Go version, fails the build, and the release job does not run
 
 ## [0.3.2] - 2026-10-27
 

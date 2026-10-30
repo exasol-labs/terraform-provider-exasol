@@ -48,11 +48,11 @@ jobs:
       - name: Build
         run: make build
 
-      # Fails on known vulnerabilities in dependencies and in the Go version
-      # from go.mod. Release depends on this job, so a vulnerable build is
-      # never published.
+      # Fails on known vulnerabilities that the provider code can reach, in
+      # dependencies and in the Go version from go.mod. Release depends on
+      # this job. A new Go advisory turns CI red until go.mod is bumped.
       - name: Run govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v4
